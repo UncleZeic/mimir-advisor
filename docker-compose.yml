@@ -1,0 +1,30 @@
+services:
+  # THE BRAIN: Runs Llama-3 locally
+  ollama:
+    image: ollama/ollama
+    container_name: mimir_brain
+    volumes:
+      - ./data/ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+
+  # THE MEMORY: The Vector Database
+  db:
+    image: chromadb/chroma
+    container_name: mimir_memory
+    volumes:
+      - ./data/vector_store:/chroma/data
+    ports:
+      - "8000:8000"
+
+  # THE ADVISOR: Your custom logic
+  advisor:
+    build: .
+    container_name: mimir_logic
+    depends_on:
+      - ollama
+      - db
+    env_file: .env
+    volumes:
+      - .:/app
+      - ./data:/app/data
