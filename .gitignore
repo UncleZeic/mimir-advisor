@@ -205,3 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local editor settings
+.idea/
+
+# Local runtime state and private data
+data/*
+!data/.gitkeep
