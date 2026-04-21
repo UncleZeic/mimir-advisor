@@ -80,6 +80,26 @@ mimir-advisor should answer questions such as:
 
 It should also aggregate across sources, provide structured summaries, and preserve privacy guarantees while doing so.
 
+## Local CLI
+
+Check whether the local services are ready:
+
+```bash
+python3 src/main.py health
+```
+
+Start an interactive chat with the local Ollama model:
+
+```bash
+python3 src/main.py chat
+```
+
+Send a one-shot prompt:
+
+```bash
+python3 src/main.py chat "What can you help me understand?"
+```
+
 ## Design Intent
 
 mimir-advisor is not a chatbot, a general AI assistant, or a cloud-first product.
