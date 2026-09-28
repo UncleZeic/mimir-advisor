@@ -1,0 +1,5 @@
+{
+  "files.watcherExclude": { "data/**": true },
+  "search.exclude": { "data/**": true },
+  "files.exclude": { "data/ollama": true, "data/vector_store": true }
+}
