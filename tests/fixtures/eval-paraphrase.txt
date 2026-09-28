@@ -1,0 +1,11 @@
+# No shared keywords with the notes; tests meaning, not word overlap
+which vector database did we choose and why | projects/metis-decisions.md
+ce model folosim pentru căutare în română | projects/metis-decisions.md
+how often are the disks checked for errors | projects/home-lab.md
+how can I reach the server when I'm away from home | projects/home-lab.md
+how much video memory does the graphics card have | projects/home-lab.md
+when do I need to replace the bike chain | jurnal/2026-09-14-revizie-bicicleta.md
+my rear brake makes noise in wet weather | jurnal/2026-09-14-revizie-bicicleta.md
+ce am hotărât despre task-urile prea mari | meetings/2026-09-10-kestrel-retro.md
+how long did code review take before and after the change | meetings/2026-09-10-kestrel-retro.md
+how do I stop work from spilling into my evenings | reading/deep-work.md
