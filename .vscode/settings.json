@@ -1,5 +1,9 @@
 {
   "files.watcherExclude": { "data/**": true },
   "search.exclude": { "data/**": true },
-  "files.exclude": { "data/ollama": true, "data/vector_store": true }
+  "files.exclude": { "data/ollama": true, "data/vector_store": true },
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.testing.unittestEnabled": true,
+  "python.testing.pytestEnabled": false,
+  "python.testing.unittestArgs": ["-v", "-s", "./tests", "-p", "test_*.py"]
 }
