@@ -82,22 +82,53 @@ It should also aggregate across sources, provide structured summaries, and prese
 
 ## Local CLI
 
-Check whether the local services are ready:
+One-time setup, from the repo root:
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+cp .env.template .env
+ollama pull llama3 && ollama pull bge-m3
+```
+
+Check that Ollama and both models are ready:
 
 ```bash
 python3 src/main.py health
 ```
 
-Start an interactive chat with the local Ollama model:
+Index and search notes. `DATA_SOURCE_DIR` defaults to the synthetic notes in
+`tests/fixtures/vault`, so nothing real is touched unless you ask for it:
 
 ```bash
-python3 src/main.py chat
+python3 src/main.py ingest                 # re-run any time; unchanged files are skipped
+python3 src/main.py search "why sqlite-vec"  # top 5 chunks with source files
+python3 src/main.py eval tests/fixtures/eval.txt
 ```
 
-Send a one-shot prompt:
+Real notes: run from a terminal outside your editor, naming the folder per command.
+Each folder gets its own index under `~/.local/share/mimir-advisor/index/`,
+so searching the fixtures can never return real chunks.
+
+```bash
+DATA_SOURCE_DIR=~/vault/tech python3 src/main.py ingest
+DATA_SOURCE_DIR=~/vault/tech python3 src/main.py search "what did I decide about backups"
+DATA_SOURCE_DIR=~/vault/tech python3 src/main.py eval ~/vault/questions.txt
+```
+
+An eval file has one `question | expected/file.md` per line, paths relative to the folder.
+Changing `EMBED_MODEL` or `CHUNK_MAX_CHARS` needs `ingest --rebuild`.
+
+Chat with the local model (no retrieval yet):
 
 ```bash
 python3 src/main.py chat "What can you help me understand?"
+```
+
+Run the tests:
+
+```bash
+python3 -m unittest discover -s tests -v
 ```
 
 ## Design Intent

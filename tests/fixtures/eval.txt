@@ -1,0 +1,7 @@
+# question | expected file (relative to the vault)
+Why did we pick sqlite-vec instead of Chroma? | projects/metis-decisions.md
+Which embedding model handles Romanian? | projects/metis-decisions.md
+How are backups rotated off site? | projects/home-lab.md
+Cât de uzat este lanțul bicicletei? | jurnal/2026-09-14-revizie-bicicleta.md
+What did the Kestrel retro decide about large stories? | meetings/2026-09-10-kestrel-retro.md
+How do I protect mornings for focused work? | reading/deep-work.md

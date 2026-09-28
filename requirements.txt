@@ -1,7 +1,2 @@
-llama-index
-llama-index-llms-ollama
-llama-index-embeddings-huggingface
-chromadb
-llama-index-vector-stores-chroma
 python-dotenv
-pydub
+sqlite-vec
