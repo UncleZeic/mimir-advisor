@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "deny": [
+      "Read(./.env)",
+      "Read(./data/**)",
+      "Read(//tank/vault/**)",
+      "Read(~/.local/share/mimir-advisor/**)"
+    ]
+  }
+}
