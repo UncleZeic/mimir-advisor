@@ -131,6 +131,21 @@ Run the tests:
 python3 -m unittest discover -s tests -v
 ```
 
+### Docker
+
+Indexes never live inside the repo, under Docker too. Compose mounts
+`~/.local/share/mimir-advisor/index` from the host at `/index` and runs the
+container as your host user, so the private (0700/0600) index files stay owned by you.
+Set your ids in `.env` and create the index dir first (otherwise Docker creates it as root):
+
+```bash
+echo "HOST_UID=$(id -u)" >> .env && echo "HOST_GID=$(id -g)" >> .env
+mkdir -p -m 700 ~/.local/share/mimir-advisor/index
+docker compose run --rm advisor python src/main.py health
+```
+
+`.dockerignore` keeps `.env`, `data/`, `.venv/`, `.git/` and editor state out of the image.
+
 ## Design Intent
 
 mimir-advisor is not a chatbot, a general AI assistant, or a cloud-first product.

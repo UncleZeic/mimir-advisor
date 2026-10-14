@@ -1,0 +1,11 @@
+# Never send secrets, private data or local state into the build context.
+.env
+.env.*
+!.env.template
+data/
+.venv/
+.git/
+.claude/
+.obsidian/
+.vscode/
+**/__pycache__

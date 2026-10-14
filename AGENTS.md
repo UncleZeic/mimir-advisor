@@ -4,3 +4,4 @@ Local-first private advisor. See README.md for principles.
 - Run tests: python3 -m unittest discover -s tests -v
 - Only synthetic data: tests/fixtures/vault. Never read .env, data/, /tank/vault or ~/.local/share/mimir-advisor.
 - No network calls except the configured OLLAMA_BASE_URL.
+- Indexes never live inside the repo, also under Docker (host ~/.local/share/mimir-advisor/index mounted at /index).
