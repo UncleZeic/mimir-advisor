@@ -12,6 +12,7 @@ import re
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
+YAML_KEY_RE = re.compile(r"^[\w.-]+\s*:(\s|$)")
 TITLE_RE = re.compile(r"^title:\s*[\"']?(.+?)[\"']?\s*$", re.MULTILINE)
 HEADING_SEPARATOR = " › "
 
@@ -24,18 +25,41 @@ class Chunk:
 
 
 def split_frontmatter(text: str) -> tuple[str, str]:
-    """Return (frontmatter, body). Frontmatter is '' when the note has none."""
+    """Return (frontmatter, body). Frontmatter is '' when the note has none.
+
+    A note opening with '---' is only frontmatter when a closing '---' line
+    follows and everything between looks like YAML keys; otherwise the
+    opening line is a horizontal rule and the whole note is body text.
+    """
     if not text.startswith("---\n"):
         return "", text
 
-    end = text.find("\n---", 4)
+    lines = text.split("\n")
 
-    if end == -1:
-        return "", text
+    for index in range(1, len(lines)):
+        if lines[index].rstrip() != "---":
+            continue
 
-    after = text.find("\n", end + 4)
-    body = "" if after == -1 else text[after + 1 :]
-    return text[4:end], body
+        block = lines[1:index]
+
+        if not _looks_like_yaml(block):
+            return "", text
+
+        return "\n".join(block), "\n".join(lines[index + 1 :])
+
+    return "", text
+
+
+def _looks_like_yaml(block: list[str]) -> bool:
+    """Empty, or a key first and then only keys, list items, indented or blank lines."""
+    filled = [line for line in block if line.strip()]
+
+    if not filled:
+        return True
+
+    return YAML_KEY_RE.match(filled[0]) is not None and all(
+        line[0] in " \t-" or YAML_KEY_RE.match(line) for line in filled[1:]
+    )
 
 
 def note_title(frontmatter: str, fallback: str) -> str:

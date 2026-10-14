@@ -19,17 +19,30 @@ class IngestReport:
     removed: int = 0
     chunks: int = 0
     empty: list[str] = field(default_factory=list)
+    unreadable: list[str] = field(default_factory=list)
 
 
 def iter_markdown_files(root: Path) -> Iterator[Path]:
-    """Every .md file under root, skipping hidden folders (.obsidian, .trash, .git)."""
+    """Every .md file under root, skipping hidden folders (.obsidian, .trash, .git).
+    Symlinks are skipped, so a link can never pull a file from outside root
+    into the index."""
+    real_root = root.resolve()
+
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
 
         if any(part.startswith(".") for part in relative.parts):
             continue
 
-        if path.is_file() and path.suffix.lower() == ".md":
+        if path.is_symlink() or not path.is_file() or path.suffix.lower() != ".md":
+            continue
+
+        try:
+            inside = path.resolve().is_relative_to(real_root)
+        except (OSError, RuntimeError):
+            inside = False
+
+        if inside:
             yield path
 
 
@@ -48,14 +61,24 @@ def ingest_folder(
     progress: Callable[[str], None] = lambda message: None,
 ) -> IngestReport:
     store.check_model(embedder.model)
+    store.check_chunk_max_chars(max_chars)
     report = IngestReport()
     known = store.file_hashes()
     seen: set[str] = set()
 
     for path in iter_markdown_files(root):
         relative = path.relative_to(root).as_posix()
+        # Seen even when unreadable: a transient error must not drop the note
+        # from the index; it is retried on the next ingest.
         seen.add(relative)
-        raw = path.read_bytes()
+
+        try:
+            raw = path.read_bytes()
+        except OSError as error:
+            report.unreadable.append(relative)
+            progress(f"  skipped {relative}: {error.strerror or error}")
+            continue
+
         file_hash = hashlib.sha256(raw).hexdigest()
 
         if known.get(relative) == file_hash:

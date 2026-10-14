@@ -1,4 +1,6 @@
+import os
 import shutil
+import sqlite3
 import stat
 import sys
 import tempfile
@@ -8,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from helpers import HashingEmbedder
+from helpers import HashingEmbedder, unreadable_file
 from ingest import ingest_folder, iter_markdown_files
 from store import IndexStore, StoreError, index_path_for
 
@@ -57,6 +59,54 @@ class DiscoveryTests(unittest.TestCase):
         self.assertNotEqual(fixtures, real)
         self.assertEqual(fixtures, index_path_for(str(FIXTURES), "/idx"))
         self.assertEqual(fixtures.parent, Path("/idx"))
+
+
+class SymlinkTests(IndexTestCase):
+    def test_symlinked_note_pointing_outside_the_vault_is_skipped(self) -> None:
+        outside = self.tmp / "outside.md"
+        outside.write_text("# Secret\n\nnot part of this vault\n", encoding="utf-8")
+        (self.vault / "leak.md").symlink_to(outside)
+
+        found = [path.name for path in iter_markdown_files(self.vault)]
+
+        self.assertNotIn("leak.md", found)
+        self.assertIn("deep-work.md", found)
+
+    def test_symlinked_folder_pointing_outside_the_vault_is_skipped(self) -> None:
+        outside = self.tmp / "elsewhere"
+        outside.mkdir()
+        (outside / "private.md").write_text("# Private\n\nsecret\n", encoding="utf-8")
+        (self.vault / "linked").symlink_to(outside, target_is_directory=True)
+
+        found = [path.name for path in iter_markdown_files(self.vault)]
+
+        self.assertNotIn("private.md", found)
+
+
+class PermissionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp)
+
+    def test_existing_loose_index_dir_and_file_are_tightened_on_open(self) -> None:
+        index_dir = self.tmp / "index"
+        index_dir.mkdir()
+        db = index_dir / "test.sqlite"
+        sqlite3.connect(db).close()
+        os.chmod(index_dir, 0o775)
+        os.chmod(db, 0o644)
+
+        IndexStore(db).close()
+
+        self.assertEqual(stat.S_IMODE(index_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(db.stat().st_mode), 0o600)
+
+    def test_new_index_dir_is_private(self) -> None:
+        IndexStore(self.tmp / "index" / "test.sqlite").close()
+
+        self.assertEqual(stat.S_IMODE((self.tmp / "index").stat().st_mode), 0o700)
 
 
 class IngestTests(IndexTestCase):
@@ -122,6 +172,47 @@ class IngestTests(IndexTestCase):
 
         with self.assertRaises(StoreError):
             ingest_folder(self.store, HashingEmbedder(model="other-model"), self.vault, 1200)
+
+    def test_changed_embedding_dimension_raises(self) -> None:
+        self.ingest()
+        (self.vault / "reading" / "deep-work.md").write_text("# Changed\n\nnew text\n", encoding="utf-8")
+
+        with self.assertRaises(StoreError) as caught:
+            ingest_folder(self.store, HashingEmbedder(dimensions=128), self.vault, 1200)
+
+        self.assertIn("256 -> 128", str(caught.exception))
+
+    def test_chunk_size_is_recorded_and_a_change_requires_rebuild(self) -> None:
+        self.ingest()
+        self.assertEqual(self.store.get_meta("chunk_max_chars"), "1200")
+
+        with self.assertRaises(StoreError) as caught:
+            ingest_folder(self.store, self.embedder, self.vault, max_chars=800)
+
+        self.assertIn("--rebuild", str(caught.exception))
+        self.assertEqual(self.store.get_meta("chunk_max_chars"), "1200")
+
+    def test_unreadable_note_is_reported_and_skipped(self) -> None:
+        unreadable = self.vault / "reading" / "deep-work.md"
+        messages: list[str] = []
+
+        with unreadable_file(unreadable):
+            report = ingest_folder(self.store, self.embedder, self.vault, 1200, messages.append)
+
+        self.assertEqual(report.unreadable, ["reading/deep-work.md"])
+        self.assertEqual(report.indexed, 4)
+        self.assertIn("  skipped reading/deep-work.md: Permission denied", messages)
+        self.assertNotIn("reading/deep-work.md", self.store.file_hashes())
+
+    def test_unreadable_note_keeps_its_previous_index_entry(self) -> None:
+        self.ingest()
+        unreadable = self.vault / "reading" / "deep-work.md"
+
+        with unreadable_file(unreadable):
+            report = self.ingest()
+
+        self.assertEqual(report.removed, 0)
+        self.assertIn("reading/deep-work.md", self.store.file_hashes())
 
     def test_index_file_is_private_to_the_user(self) -> None:
         mode = stat.S_IMODE((self.tmp / "index" / "test.sqlite").stat().st_mode)

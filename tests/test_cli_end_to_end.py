@@ -5,6 +5,7 @@ import io
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -17,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import main
-from helpers import HashingEmbedder
+from helpers import HashingEmbedder, unreadable_file
+from store import index_path_for
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 EMBEDDER = HashingEmbedder(model="bge-m3")
@@ -112,6 +114,81 @@ class CliEndToEndTests(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertIn("Source folder not found", out)
+
+    def index_path(self) -> Path:
+        return index_path_for(self.env["DATA_SOURCE_DIR"], self.env["INDEX_DIR"])
+
+    def test_rebuild_deletes_and_recreates_the_index(self) -> None:
+        self.run_cli("ingest")
+
+        with sqlite3.connect(self.index_path()) as conn:
+            conn.execute("INSERT INTO meta(key, value) VALUES ('marker', 'old index')")
+            conn.execute("INSERT INTO files(path, hash) VALUES ('stale.md', 'x')")
+
+        code, out = self.run_cli("ingest", "--rebuild")
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("Done: 5 indexed", out)
+        self.assertIn("0 unchanged, 0 removed", out)
+        self.assertIn("Index now holds 6 files", out)
+
+        with sqlite3.connect(self.index_path()) as conn:
+            self.assertIsNone(conn.execute("SELECT value FROM meta WHERE key = 'marker'").fetchone())
+
+    def test_changed_chunk_size_requires_rebuild(self) -> None:
+        self.run_cli("ingest")
+        self.env["CHUNK_MAX_CHARS"] = "800"
+
+        code, out = self.run_cli("ingest")
+        self.assertEqual(code, 1)
+        self.assertIn("Ingest stopped", out)
+        self.assertIn("CHUNK_MAX_CHARS=1200", out)
+        self.assertIn("--rebuild", out)
+
+        code, out = self.run_cli("ingest", "--rebuild")
+        self.assertEqual(code, 0, out)
+        self.assertIn("Done: 5 indexed", out)
+
+    def test_corrupt_index_fails_cleanly(self) -> None:
+        self.index_path().write_bytes(b"this is not a sqlite database" * 100)
+
+        code, out = self.run_cli("ingest")
+        self.assertEqual(code, 1)
+        self.assertIn("Ingest stopped", out)
+        self.assertIn(str(self.index_path()), out)
+        self.assertNotIn("Traceback", out)
+
+        code, out = self.run_cli("search", "anything")
+        self.assertEqual(code, 1)
+        self.assertIn("Search failed", out)
+        self.assertIn(str(self.index_path()), out)
+
+        code, out = self.run_cli("eval", str(FIXTURES / "eval.txt"))
+        self.assertEqual(code, 1)
+        self.assertIn("Search failed", out)
+        self.assertIn(str(self.index_path()), out)
+
+    def test_unwritable_index_location_fails_cleanly(self) -> None:
+        blocker = Path(self.tmp) / "not-a-dir"
+        blocker.write_text("", encoding="utf-8")
+        self.env["INDEX_DIR"] = str(blocker)
+
+        code, out = self.run_cli("ingest")
+
+        self.assertEqual(code, 1)
+        self.assertIn("Ingest stopped", out)
+        self.assertIn(str(blocker), out)
+
+    def test_unreadable_note_is_reported_and_ingest_continues(self) -> None:
+        note = FIXTURES / "vault" / "reading" / "deep-work.md"
+
+        with unreadable_file(note):
+            code, out = self.run_cli("ingest")
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("skipped reading/deep-work.md: Permission denied", out)
+        self.assertIn("Done: 4 indexed", out)
+        self.assertIn("Skipped 1 unreadable: reading/deep-work.md", out)
 
 
 if __name__ == "__main__":

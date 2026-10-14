@@ -25,6 +25,42 @@ class FrontmatterTests(unittest.TestCase):
         self.assertEqual(note_title(frontmatter, "just-a-note"), "just-a-note")
         self.assertTrue(body.startswith("# Just a note"))
 
+    def test_empty_frontmatter_keeps_the_body(self) -> None:
+        frontmatter, body = split_frontmatter("---\n---\n# Title\n\nBody text\n")
+
+        self.assertEqual(frontmatter, "")
+        self.assertEqual(body, "# Title\n\nBody text\n")
+        self.assertEqual([chunk.text for chunk in chunk_markdown("---\n---\nBody text\n")], ["Body text"])
+
+    def test_leading_rule_without_closing_line_is_body(self) -> None:
+        text = "---\nFirst paragraph after a rule.\n\nSecond paragraph.\n"
+        frontmatter, body = split_frontmatter(text)
+
+        self.assertEqual(frontmatter, "")
+        self.assertEqual(body, text)
+
+    def test_leading_rule_plus_later_rule_loses_nothing(self) -> None:
+        text = "---\nOpening thoughts on the week.\n\n---\n\nAfter the second rule.\n"
+        frontmatter, body = split_frontmatter(text)
+        joined = " ".join(chunk.text for chunk in chunk_markdown(text))
+
+        self.assertEqual(frontmatter, "")
+        self.assertEqual(body, text)
+        self.assertIn("Opening thoughts on the week.", joined)
+        self.assertIn("After the second rule.", joined)
+
+    def test_closing_line_must_be_exactly_three_dashes(self) -> None:
+        frontmatter, body = split_frontmatter("---\ntitle: x\n----\nstill yaml?\n---\nBody\n")
+
+        self.assertEqual(frontmatter, "")
+        self.assertTrue(body.startswith("---\ntitle: x"))
+
+    def test_frontmatter_with_list_values(self) -> None:
+        frontmatter, body = split_frontmatter("---\ntitle: x\ntags:\n  - a\n- b\n---\nBody\n")
+
+        self.assertEqual(frontmatter, "title: x\ntags:\n  - a\n- b")
+        self.assertEqual(body, "Body\n")
+
 
 class ChunkMarkdownTests(unittest.TestCase):
     def test_sections_carry_their_heading_path(self) -> None:

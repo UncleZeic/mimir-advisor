@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import math
+from pathlib import Path
 import re
+from unittest.mock import patch
 
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
@@ -31,3 +33,16 @@ class HashingEmbedder:
 
         norm = math.sqrt(sum(value * value for value in vector)) or 1.0
         return [value / norm for value in vector]
+
+
+def unreadable_file(target: Path):
+    """Make one file raise PermissionError on read, without relying on chmod
+    (which root ignores)."""
+    read_bytes = Path.read_bytes
+
+    def fake_read_bytes(path: Path) -> bytes:
+        if path == target:
+            raise PermissionError(13, "Permission denied", str(path))
+        return read_bytes(path)
+
+    return patch.object(Path, "read_bytes", fake_read_bytes)

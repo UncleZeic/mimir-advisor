@@ -37,29 +37,34 @@ class IndexStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        is_new = not path.exists()
+        # Every open, not only on create: an index dir or file made by an older
+        # version, another tool or a loose umask still holds note text.
+        os.chmod(path.parent, 0o700)
         self.conn = sqlite3.connect(path)
 
-        if is_new:
+        try:
             os.chmod(path, 0o600)
 
-        self.conn.enable_load_extension(True)
-        sqlite_vec.load(self.conn)
-        self.conn.enable_load_extension(False)
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, hash TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS chunks (
-                id INTEGER PRIMARY KEY,
-                path TEXT NOT NULL,
-                heading TEXT NOT NULL,
-                ordinal INTEGER NOT NULL,
-                text TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS chunks_path ON chunks(path);
-            """
-        )
+            self.conn.enable_load_extension(True)
+            sqlite_vec.load(self.conn)
+            self.conn.enable_load_extension(False)
+            self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, hash TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id INTEGER PRIMARY KEY,
+                    path TEXT NOT NULL,
+                    heading TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    text TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS chunks_path ON chunks(path);
+                """
+            )
+        except BaseException:
+            self.conn.close()
+            raise
 
     def close(self) -> None:
         self.conn.close()
@@ -82,6 +87,20 @@ class IndexStore:
             raise StoreError(
                 f"This index was built with '{indexed_model}', but EMBED_MODEL is '{model}'. "
                 "Run ingest with --rebuild to re-embed everything."
+            )
+
+    def check_chunk_max_chars(self, max_chars: int) -> None:
+        """Chunks cut at a different size would mix with the old ones, so a
+        changed CHUNK_MAX_CHARS needs a rebuild. Recorded on first use."""
+        indexed = self.get_meta("chunk_max_chars")
+
+        if indexed is None:
+            with self.conn:
+                self._set_meta("chunk_max_chars", str(max_chars))
+        elif int(indexed) != max_chars:
+            raise StoreError(
+                f"This index was chunked with CHUNK_MAX_CHARS={indexed}, but it is now {max_chars}. "
+                "Run ingest with --rebuild to re-chunk everything."
             )
 
     def _ensure_vector_table(self, model: str, dimensions: int) -> None:

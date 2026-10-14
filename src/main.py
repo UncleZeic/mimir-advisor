@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 import os
 from pathlib import Path
 import re
+import sqlite3
 import sys
 
 try:
@@ -278,27 +279,35 @@ def run_ingest_command(settings: Settings, rebuild: bool = False) -> int:
         return 1
 
     index_path = index_path_for(settings.data_source_dir, settings.index_dir)
-
-    if rebuild and index_path.exists():
-        index_path.unlink()
-
     print(f"Ingesting {root}")
     print(f"Index: {index_path}")
-    store = open_index(settings, must_exist=False)
 
     try:
-        report = ingest_folder(store, make_embedder(settings), root, settings.chunk_max_chars, print)
-        files, chunks = store.stats()
+        if rebuild and index_path.exists():
+            index_path.unlink()
+
+        store = open_index(settings, must_exist=False)
+
+        try:
+            report = ingest_folder(store, make_embedder(settings), root, settings.chunk_max_chars, print)
+            files, chunks = store.stats()
+        finally:
+            store.close()
     except (EmbeddingError, StoreError) as error:
         print(f"Ingest stopped: {error}", file=sys.stderr)
         return 1
-    finally:
-        store.close()
+    except (sqlite3.Error, OSError) as error:
+        print(f"Ingest stopped: {error} (index: {index_path})", file=sys.stderr)
+        return 1
 
     print(
         f"Done: {report.indexed} indexed ({report.chunks} chunks), "
         f"{report.unchanged} unchanged, {report.removed} removed, {len(report.empty)} empty."
     )
+
+    if report.unreadable:
+        print(f"Skipped {len(report.unreadable)} unreadable: {', '.join(report.unreadable)}", file=sys.stderr)
+
     print(f"Index now holds {files} files, {chunks} chunks.")
     return 0
 
@@ -306,22 +315,26 @@ def run_ingest_command(settings: Settings, rebuild: bool = False) -> int:
 def search_index(settings: Settings, query: str, k: int):
     """Return (hits, error_message). Opens and closes the index."""
     from embeddings import EmbeddingError
-    from store import StoreError
-
-    store = open_index(settings, must_exist=True)
-
-    if store is None:
-        return None, "no index"
+    from store import StoreError, index_path_for
 
     try:
-        embedder = make_embedder(settings)
-        store.check_model(embedder.model)
-        vector = embedder.embed([query])[0]
-        return store.search(vector, k), None
+        store = open_index(settings, must_exist=True)
+
+        if store is None:
+            return None, "no index"
+
+        try:
+            embedder = make_embedder(settings)
+            store.check_model(embedder.model)
+            vector = embedder.embed([query])[0]
+            return store.search(vector, k), None
+        finally:
+            store.close()
     except (EmbeddingError, StoreError) as error:
         return None, str(error)
-    finally:
-        store.close()
+    except (sqlite3.Error, OSError) as error:
+        index_path = index_path_for(settings.data_source_dir, settings.index_dir)
+        return None, f"{error} (index: {index_path})"
 
 
 def run_search_command(settings: Settings, query: str, k: int = 5, full: bool = False) -> int:
