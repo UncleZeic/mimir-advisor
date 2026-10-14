@@ -10,6 +10,7 @@
 ## Next
 - [ ] Sentry: sensitivity classification at ingest (red/amber/green)
 - [ ] Adviser: source-grounded answering over retrieved chunks
+- [ ] Chat: switch model and thinking mid-session (local Ollama models only, validated via /api/tags; show active model in prompt)
 - [ ] Reranker in the retrieval path
 
 ## Someday
