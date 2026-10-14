@@ -25,7 +25,7 @@ EMBEDDER = HashingEmbedder(model="bge-m3")
 
 class FakeOllama(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
-        self._send({"models": [{"name": "llama3:latest"}, {"name": "bge-m3:latest"}]})
+        self._send({"models": [{"name": "qwen3:8b"}, {"name": "bge-m3:latest"}]})
 
     def do_POST(self) -> None:
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))

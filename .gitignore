@@ -208,6 +208,7 @@ __marimo__/
 
 # Local editor settings
 .idea/
+.obsidian/
 
 # Local runtime state and private data
 data/*

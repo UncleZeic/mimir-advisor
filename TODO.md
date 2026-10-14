@@ -1,7 +1,10 @@
 # TODO
 
 ## Now
-- [ ] Ingest one vault folder: chunk markdown, embed, store in sqlite-vec,
+- [ ] Evaluation set: questions with expected source files, scored with `eval`
+
+## Done
+- [x] Ingest one vault folder: chunk markdown, embed, store in sqlite-vec,
       `search` command prints top-5 chunks with source filenames. No model call.
 
 ## Next

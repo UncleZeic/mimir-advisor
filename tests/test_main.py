@@ -33,7 +33,7 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.project_name, "mimir-advisor")
         self.assertEqual(settings.persona, "Adjutant_Mimir")
-        self.assertEqual(settings.model_name, "llama3")
+        self.assertEqual(settings.model_name, "qwen3:8b")
         self.assertEqual(settings.embed_model, "bge-m3")
         self.assertEqual(settings.ollama_base_url, "http://localhost:11434")
         self.assertEqual(settings.data_source_dir, "./tests/fixtures/vault")
@@ -228,6 +228,35 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(payload["model"], "llama3")
         self.assertFalse(payload["stream"])
         self.assertEqual(payload["messages"][-1], {"role": "user", "content": "What do you know?"})
+
+    def test_ask_ollama_disables_thinking(self) -> None:
+        response = UrlopenResponse(200, b'{"message": {"content": "ok"}}')
+
+        with patch.object(main, "urlopen", return_value=response) as urlopen:
+            main.ask_ollama(self._settings(), "hi")
+
+        payload = json_from_request(urlopen.call_args.args[0])
+
+        self.assertIs(payload["think"], False)
+
+    def test_ask_ollama_strips_think_block(self) -> None:
+        response = UrlopenResponse(
+            200,
+            b'{"message": {"content": "<think>\\nLet me reason.\\nStill thinking.\\n</think>\\n\\nThe answer."}}',
+        )
+
+        with patch.object(main, "urlopen", return_value=response):
+            answer = main.ask_ollama(self._settings(), "hi")
+
+        self.assertEqual(answer, "The answer.")
+
+    def test_ask_ollama_leaves_answer_without_think_block_unchanged(self) -> None:
+        response = UrlopenResponse(200, b'{"message": {"content": "Plain answer, no reasoning."}}')
+
+        with patch.object(main, "urlopen", return_value=response):
+            answer = main.ask_ollama(self._settings(), "hi")
+
+        self.assertEqual(answer, "Plain answer, no reasoning.")
 
     def test_run_chat_command_returns_one_when_ollama_is_unavailable(self) -> None:
         with (

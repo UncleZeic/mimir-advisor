@@ -88,7 +88,7 @@ One-time setup, from the repo root:
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 cp .env.template .env
-ollama pull llama3 && ollama pull bge-m3
+ollama pull qwen3:8b && ollama pull bge-m3
 ```
 
 Check that Ollama and both models are ready:
@@ -111,9 +111,9 @@ Each folder gets its own index under `~/.local/share/mimir-advisor/index/`,
 so searching the fixtures can never return real chunks.
 
 ```bash
-DATA_SOURCE_DIR=~/vault/tech python3 src/main.py ingest
-DATA_SOURCE_DIR=~/vault/tech python3 src/main.py search "what did I decide about backups"
-DATA_SOURCE_DIR=~/vault/tech python3 src/main.py eval ~/vault/questions.txt
+DATA_SOURCE_DIR=/tank/vault/tech python3 src/main.py ingest
+DATA_SOURCE_DIR=/tank/vault/tech python3 src/main.py search "what did I decide about backups"
+DATA_SOURCE_DIR=/tank/vault/tech python3 src/main.py eval /tank/vault/questions.txt
 ```
 
 An eval file has one `question | expected/file.md` per line, paths relative to the folder.

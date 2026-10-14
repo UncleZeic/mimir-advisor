@@ -8,6 +8,7 @@
       "program": "${workspaceFolder}/src/main.py",
       "args": ["search", "${input:query}"],
       "cwd": "${workspaceFolder}",
+      "env": { "DATA_SOURCE_DIR": "${workspaceFolder}/tests/fixtures/vault" },
       "console": "integratedTerminal"
     },
     {
@@ -17,6 +18,7 @@
       "program": "${workspaceFolder}/src/main.py",
       "args": ["ingest"],
       "cwd": "${workspaceFolder}",
+      "env": { "DATA_SOURCE_DIR": "${workspaceFolder}/tests/fixtures/vault" },
       "console": "integratedTerminal"
     }
   ],

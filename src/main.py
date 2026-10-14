@@ -11,6 +11,7 @@ from urllib.request import Request, urlopen
 
 import os
 from pathlib import Path
+import re
 import sys
 
 try:
@@ -34,6 +35,7 @@ except ModuleNotFoundError:
 
 
 DEFAULT_DATA_SOURCE_DIR = "./tests/fixtures/vault"
+THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -65,7 +67,7 @@ def load_settings() -> Settings:
     return Settings(
         project_name=os.getenv("PROJECT_NAME", "mimir-advisor"),
         persona=os.getenv("PERSONA", "Adjutant_Mimir"),
-        model_name=os.getenv("MODEL_NAME", "llama3"),
+        model_name=os.getenv("MODEL_NAME", "qwen3:8b"),
         embed_model=os.getenv("EMBED_MODEL", "bge-m3"),
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
         # Fixtures by default: anything run without an explicit override only
@@ -169,6 +171,7 @@ def ask_ollama(settings: Settings, prompt: str) -> str:
     payload = {
         "model": settings.model_name,
         "stream": False,
+        "think": False,
         "messages": [
             {
                 "role": "system",
@@ -191,7 +194,9 @@ def ask_ollama(settings: Settings, prompt: str) -> str:
     with urlopen(request, timeout=settings.chat_timeout_seconds) as response:
         body = json.loads(response.read().decode("utf-8"))
 
-    return body.get("message", {}).get("content", "").strip()
+    content = body.get("message", {}).get("content", "")
+    # Older Ollama versions ignore "think" and inline the reasoning instead.
+    return THINK_BLOCK.sub("", content).strip()
 
 
 def run_chat_command(settings: Settings, prompt: str | None = None) -> int:
