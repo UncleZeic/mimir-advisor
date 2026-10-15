@@ -1,5 +1,7 @@
 # mimir-advisor
 
+[![CI](https://github.com/UncleZeic/mimir-advisor/actions/workflows/ci.yml/badge.svg)](https://github.com/UncleZeic/mimir-advisor/actions/workflows/ci.yml)
+
 mimir-advisor helps you understand your life clearly, using your own data, without compromising your privacy.
 
 It turns fragmented personal information into structured insight, so you can recall accurately, reflect objectively, and decide intentionally. Reasoning is local-first and policy-controlled.
