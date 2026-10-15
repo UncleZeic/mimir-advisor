@@ -250,6 +250,22 @@ class ChatTests(unittest.TestCase):
 
         self.assertEqual(answer, "The answer.")
 
+    def test_ask_ollama_strips_single_line_think_block(self) -> None:
+        response = UrlopenResponse(200, b'{"message": {"content": "<think>quick thought</think>The answer."}}')
+
+        with patch.object(main, "urlopen", return_value=response):
+            answer = main.ask_ollama(self._settings(), "hi")
+
+        self.assertEqual(answer, "The answer.")
+
+    def test_strip_think_removes_every_block_and_keeps_the_rest(self) -> None:
+        text = "<think>a</think>First.\n<think>\nb\nc\n</think>\nSecond."
+
+        self.assertEqual(main.strip_think(text), "First.\n\nSecond.")
+
+    def test_strip_think_leaves_text_without_think_block_unchanged(self) -> None:
+        self.assertEqual(main.strip_think("No reasoning here."), "No reasoning here.")
+
     def test_ask_ollama_leaves_answer_without_think_block_unchanged(self) -> None:
         response = UrlopenResponse(200, b'{"message": {"content": "Plain answer, no reasoning."}}')
 

@@ -195,9 +195,12 @@ def ask_ollama(settings: Settings, prompt: str) -> str:
     with urlopen(request, timeout=settings.chat_timeout_seconds) as response:
         body = json.loads(response.read().decode("utf-8"))
 
-    content = body.get("message", {}).get("content", "")
-    # Older Ollama versions ignore "think" and inline the reasoning instead.
-    return THINK_BLOCK.sub("", content).strip()
+    return strip_think(body.get("message", {}).get("content", ""))
+
+
+def strip_think(text: str) -> str:
+    """Older Ollama versions ignore "think" and inline the reasoning instead."""
+    return THINK_BLOCK.sub("", text).strip()
 
 
 def run_chat_command(settings: Settings, prompt: str | None = None) -> int:
