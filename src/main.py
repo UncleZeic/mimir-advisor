@@ -5,9 +5,11 @@ from __future__ import annotations
 from argparse import ArgumentParser
 from dataclasses import dataclass
 import json
-from typing import Iterable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import Request
+
+from local_http import urlopen
 
 import os
 from pathlib import Path
@@ -37,6 +39,13 @@ except ModuleNotFoundError:
 
 DEFAULT_DATA_SOURCE_DIR = "./tests/fixtures/vault"
 THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
+LOCAL_OLLAMA_HOSTS = ("localhost", "127.0.0.1", "::1", "host.docker.internal")
+# Must exceed the chunker's 150-char overlap, or hard splits cannot advance.
+MIN_CHUNK_MAX_CHARS = 300
+
+
+class SettingsError(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -64,22 +73,44 @@ class HealthCheck:
 
 def load_settings() -> Settings:
     load_dotenv()
+    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    chunk_max_chars = int(os.getenv("CHUNK_MAX_CHARS", "1200"))
+    check_ollama_base_url(ollama_base_url)
+
+    if chunk_max_chars < MIN_CHUNK_MAX_CHARS:
+        raise SettingsError(
+            f"CHUNK_MAX_CHARS must be at least {MIN_CHUNK_MAX_CHARS} "
+            f"(it must exceed the chunk overlap); got {chunk_max_chars}."
+        )
 
     return Settings(
         project_name=os.getenv("PROJECT_NAME", "mimir-advisor"),
         persona=os.getenv("PERSONA", "Adjutant_Mimir"),
         model_name=os.getenv("MODEL_NAME", "qwen3:8b"),
         embed_model=os.getenv("EMBED_MODEL", "bge-m3"),
-        ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
+        ollama_base_url=ollama_base_url,
         # Fixtures by default: anything run without an explicit override only
         # ever sees synthetic notes. Real notes need DATA_SOURCE_DIR on purpose.
         data_source_dir=os.getenv("DATA_SOURCE_DIR", DEFAULT_DATA_SOURCE_DIR),
-        index_dir=os.getenv("INDEX_DIR", default_index_dir()),
-        chunk_max_chars=int(os.getenv("CHUNK_MAX_CHARS", "1200")),
+        # `or`, not a getenv default: an empty INDEX_DIR= in .env must not
+        # resolve to the current directory, which is usually the repo.
+        index_dir=os.getenv("INDEX_DIR") or default_index_dir(),
+        chunk_max_chars=chunk_max_chars,
         health_timeout_seconds=float(os.getenv("HEALTH_TIMEOUT_SECONDS", "2")),
         chat_timeout_seconds=float(os.getenv("OLLAMA_CHAT_TIMEOUT_SECONDS", "60")),
         embed_timeout_seconds=float(os.getenv("OLLAMA_EMBED_TIMEOUT_SECONDS", "120")),
     )
+
+
+def check_ollama_base_url(url: str) -> None:
+    """Prompts and note text go to this URL, so it must be this machine."""
+    parts = urlsplit(url)
+
+    if parts.scheme not in {"http", "https"} or parts.hostname not in LOCAL_OLLAMA_HOSTS:
+        raise SettingsError(
+            f"OLLAMA_BASE_URL must point at a local Ollama ({', '.join(LOCAL_OLLAMA_HOSTS)}), "
+            f"got {url!r}. Note text is never sent to another host."
+        )
 
 
 def default_index_dir() -> str:
@@ -88,25 +119,21 @@ def default_index_dir() -> str:
     return os.path.join(data_home, "mimir-advisor", "index")
 
 
-def check_http_endpoint(name: str, urls: Iterable[str], timeout: float) -> HealthCheck:
-    endpoints = list(urls)
-    last_error = "no health endpoints configured"
+def check_http_endpoint(name: str, url: str, timeout: float) -> HealthCheck:
+    try:
+        with urlopen(url, timeout=timeout) as response:
+            if 200 <= response.status < 300:
+                return HealthCheck(name=name, url=url, ok=True, detail="reachable")
 
-    for url in endpoints:
-        try:
-            with urlopen(url, timeout=timeout) as response:
-                if 200 <= response.status < 300:
-                    return HealthCheck(name=name, url=url, ok=True, detail="reachable")
+            detail = f"HTTP {response.status}"
+    except HTTPError as error:
+        detail = f"HTTP {error.code}"
+    except URLError as error:
+        detail = str(error.reason)
+    except TimeoutError:
+        detail = "request timed out"
 
-                last_error = f"HTTP {response.status}"
-        except HTTPError as error:
-            last_error = f"HTTP {error.code}"
-        except URLError as error:
-            last_error = str(error.reason)
-        except TimeoutError:
-            last_error = "request timed out"
-
-    return HealthCheck(name=name, url=endpoints[-1], ok=False, detail=last_error)
+    return HealthCheck(name=name, url=url, ok=False, detail=detail)
 
 
 def installed_ollama_models(settings: Settings) -> set[str]:
@@ -124,7 +151,7 @@ def model_is_installed(model: str, installed: set[str]) -> bool:
 
 def run_health_checks(settings: Settings) -> list[HealthCheck]:
     tags_url = f"{settings.ollama_base_url.rstrip('/')}/api/tags"
-    ollama = check_http_endpoint("Ollama", [tags_url], settings.health_timeout_seconds)
+    ollama = check_http_endpoint("Ollama", tags_url, settings.health_timeout_seconds)
     checks = [ollama]
 
     try:
@@ -206,7 +233,7 @@ def strip_think(text: str) -> str:
 def run_chat_command(settings: Settings, prompt: str | None = None) -> int:
     ollama_check = check_http_endpoint(
         "Ollama",
-        [f"{settings.ollama_base_url.rstrip('/')}/api/tags"],
+        f"{settings.ollama_base_url.rstrip('/')}/api/tags",
         settings.health_timeout_seconds,
     )
 
@@ -273,7 +300,7 @@ def make_embedder(settings: Settings):
 def run_ingest_command(settings: Settings, rebuild: bool = False) -> int:
     from embeddings import EmbeddingError
     from ingest import ingest_folder
-    from store import StoreError, index_path_for
+    from store import IndexStore, StoreError, index_path_for, remove_sidecars, temporary_path
 
     root = Path(settings.data_source_dir).expanduser().resolve()
 
@@ -281,26 +308,41 @@ def run_ingest_command(settings: Settings, rebuild: bool = False) -> int:
         print(f"Source folder not found: {root}", file=sys.stderr)
         return 1
 
-    index_path = index_path_for(settings.data_source_dir, settings.index_dir)
+    try:
+        index_path = index_path_for(settings.data_source_dir, settings.index_dir)
+    except StoreError as error:
+        print(f"Ingest stopped: {error}", file=sys.stderr)
+        return 1
+
     print(f"Ingesting {root}")
     print(f"Index: {index_path}")
+    # A rebuild goes into a side file and replaces the old index only once it
+    # is complete, so a failed rebuild leaves the previous index usable.
+    build_path = temporary_path(index_path) if rebuild else index_path
 
     try:
-        if rebuild and index_path.exists():
-            index_path.unlink()
+        if rebuild:
+            build_path.unlink(missing_ok=True)
+            remove_sidecars(build_path)
 
-        store = open_index(settings, must_exist=False)
+        store = IndexStore(build_path)
 
         try:
             report = ingest_folder(store, make_embedder(settings), root, settings.chunk_max_chars, print)
             files, chunks = store.stats()
         finally:
             store.close()
-    except (EmbeddingError, StoreError) as error:
-        print(f"Ingest stopped: {error}", file=sys.stderr)
-        return 1
-    except (sqlite3.Error, OSError) as error:
-        print(f"Ingest stopped: {error} (index: {index_path})", file=sys.stderr)
+
+        if rebuild:
+            remove_sidecars(index_path)
+            os.replace(build_path, index_path)
+            remove_sidecars(build_path)
+    except (EmbeddingError, StoreError, sqlite3.Error, OSError) as error:
+        if rebuild:
+            discard_index(build_path)
+
+        where = "" if isinstance(error, (EmbeddingError, StoreError)) else f" (index: {build_path})"
+        print(f"Ingest stopped: {error}{where}", file=sys.stderr)
         return 1
 
     print(
@@ -313,6 +355,17 @@ def run_ingest_command(settings: Settings, rebuild: bool = False) -> int:
 
     print(f"Index now holds {files} files, {chunks} chunks.")
     return 0
+
+
+def discard_index(path: Path) -> None:
+    """Best effort: a half-built index still holds note text."""
+    from store import remove_sidecars
+
+    try:
+        path.unlink(missing_ok=True)
+        remove_sidecars(path)
+    except OSError:
+        pass
 
 
 def search_index(settings: Settings, query: str, k: int):
@@ -440,7 +493,12 @@ def build_parser() -> ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    settings = load_settings()
+
+    try:
+        settings = load_settings()
+    except SettingsError as error:
+        print(f"Invalid settings: {error}", file=sys.stderr)
+        return 2
 
     if args.command == "chat":
         prompt = " ".join(args.prompt).strip() or None

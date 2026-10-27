@@ -109,8 +109,10 @@ python3 src/main.py eval tests/fixtures/eval.txt
 ```
 
 Real notes: run from a terminal outside your editor, naming the folder per command.
-Each folder gets its own index under `~/.local/share/mimir-advisor/index/`,
-so searching the fixtures can never return real chunks.
+Each folder gets its own index under `~/.local/share/mimir-advisor/index/mimir-advisor-index/`,
+so searching the fixtures can never return real chunks. `INDEX_DIR` overrides the base folder;
+it is refused inside the repo or the notes folder, and only the `mimir-advisor-index/`
+subfolder (0700) is ever created or tightened in it.
 
 ```bash
 DATA_SOURCE_DIR=/tank/vault/tech python3 src/main.py ingest
@@ -119,7 +121,8 @@ DATA_SOURCE_DIR=/tank/vault/tech python3 src/main.py eval /tank/vault/questions.
 ```
 
 An eval file has one `question | expected/file.md` per line, paths relative to the folder.
-Changing `EMBED_MODEL` or `CHUNK_MAX_CHARS` needs `ingest --rebuild`.
+Changing `EMBED_MODEL` or `CHUNK_MAX_CHARS` needs `ingest --rebuild`, which builds a
+new index next to the old one and swaps it in only when it completes.
 
 Chat with the local model (no retrieval yet):
 

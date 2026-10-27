@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import re
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
-FENCE_RE = re.compile(r"^\s*(```|~~~)")
+FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 YAML_KEY_RE = re.compile(r"^[\w.-]+\s*:(\s|$)")
 TITLE_RE = re.compile(r"^title:\s*[\"']?(.+?)[\"']?\s*$", re.MULTILINE)
 HEADING_SEPARATOR = " › "
@@ -31,6 +31,8 @@ def split_frontmatter(text: str) -> tuple[str, str]:
     follows and everything between looks like YAML keys; otherwise the
     opening line is a horizontal rule and the whole note is body text.
     """
+    text = text.lstrip("\ufeff")
+
     if not text.startswith("---\n"):
         return "", text
 
@@ -68,13 +70,19 @@ def note_title(frontmatter: str, fallback: str) -> str:
 
 
 def chunk_markdown(text: str, max_chars: int = 1200, overlap: int = 150) -> list[Chunk]:
+    if max_chars <= overlap:
+        # A hard split would never advance past its own overlap.
+        raise ValueError(f"max_chars ({max_chars}) must exceed overlap ({overlap})")
+
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     _, body = split_frontmatter(text)
 
     chunks: list[Chunk] = []
     stack: list[tuple[int, str]] = []
     lines: list[str] = []
-    in_fence = False
+    # The opening fence, e.g. "````"; '' outside a fence. Only the same
+    # character at least as long closes it, so "```" inside "````" is content.
+    fence = ""
 
     def flush() -> None:
         section = "\n".join(lines).strip()
@@ -89,12 +97,20 @@ def chunk_markdown(text: str, max_chars: int = 1200, overlap: int = 150) -> list
             chunks.append(Chunk(heading=heading, ordinal=len(chunks), text=piece))
 
     for line in body.split("\n"):
-        if FENCE_RE.match(line):
-            in_fence = not in_fence
+        marker = FENCE_RE.match(line)
+
+        if marker:
+            run = marker.group(1)
+
+            if not fence:
+                fence = run
+            elif run[0] == fence[0] and len(run) >= len(fence):
+                fence = ""
+
             lines.append(line)
             continue
 
-        match = None if in_fence else HEADING_RE.match(line)
+        match = None if fence else HEADING_RE.match(line)
 
         if match is None:
             lines.append(line)

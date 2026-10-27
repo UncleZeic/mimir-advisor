@@ -48,8 +48,15 @@ def iter_markdown_files(root: Path) -> Iterator[Path]:
 
 def embedding_text(title: str, heading: str, text: str) -> str:
     """Prefix each chunk with where it lives, so a section called 'Decision'
-    is still findable by the note's subject."""
-    context = title if not heading else f"{title}{HEADING_SEPARATOR}{heading}"
+    is still findable by the note's subject. The title is left out when the
+    heading path already starts with it (a note whose H1 repeats its title)."""
+    if not heading:
+        context = title
+    elif heading == title or heading.startswith(f"{title}{HEADING_SEPARATOR}"):
+        context = heading
+    else:
+        context = f"{title}{HEADING_SEPARATOR}{heading}"
+
     return f"{context}\n\n{text}"
 
 
@@ -85,7 +92,9 @@ def ingest_folder(
             report.unchanged += 1
             continue
 
-        text = raw.decode("utf-8", errors="replace")
+        # utf-8-sig: editors on Windows prepend a BOM that would hide the
+        # frontmatter and the first heading.
+        text = raw.decode("utf-8-sig", errors="replace")
         frontmatter, _ = split_frontmatter(text.replace("\r\n", "\n"))
         title = note_title(frontmatter, path.stem)
         chunks = chunk_markdown(text, max_chars=max_chars)

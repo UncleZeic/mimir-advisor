@@ -6,13 +6,15 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from helpers import HashingEmbedder, unreadable_file
-from ingest import ingest_folder, iter_markdown_files
-from store import IndexStore, StoreError, index_path_for
+from ingest import embedding_text, ingest_folder, iter_markdown_files
+import store
+from store import INDEX_SUBDIR, REPO_ROOT, IndexStore, StoreError, index_path_for, remove_sidecars
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "vault"
 
@@ -22,7 +24,8 @@ class IndexTestCase(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.vault = self.tmp / "vault"
         shutil.copytree(FIXTURES, self.vault)
-        self.store = IndexStore(self.tmp / "index" / "test.sqlite")
+        self.db = self.tmp / "index" / INDEX_SUBDIR / "test.sqlite"
+        self.store = IndexStore(self.db)
         self.embedder = HashingEmbedder()
 
     def tearDown(self) -> None:
@@ -58,7 +61,7 @@ class DiscoveryTests(unittest.TestCase):
 
         self.assertNotEqual(fixtures, real)
         self.assertEqual(fixtures, index_path_for(str(FIXTURES), "/idx"))
-        self.assertEqual(fixtures.parent, Path("/idx"))
+        self.assertEqual(fixtures.parent, Path("/idx") / INDEX_SUBDIR)
 
 
 class SymlinkTests(IndexTestCase):
@@ -91,8 +94,8 @@ class PermissionTests(unittest.TestCase):
         shutil.rmtree(self.tmp)
 
     def test_existing_loose_index_dir_and_file_are_tightened_on_open(self) -> None:
-        index_dir = self.tmp / "index"
-        index_dir.mkdir()
+        index_dir = self.tmp / "index" / INDEX_SUBDIR
+        index_dir.mkdir(parents=True)
         db = index_dir / "test.sqlite"
         sqlite3.connect(db).close()
         os.chmod(index_dir, 0o775)
@@ -104,9 +107,106 @@ class PermissionTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(db.stat().st_mode), 0o600)
 
     def test_new_index_dir_is_private(self) -> None:
-        IndexStore(self.tmp / "index" / "test.sqlite").close()
+        IndexStore(self.tmp / "index" / INDEX_SUBDIR / "test.sqlite").close()
 
-        self.assertEqual(stat.S_IMODE((self.tmp / "index").stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((self.tmp / "index" / INDEX_SUBDIR).stat().st_mode), 0o700)
+
+    def test_index_dir_itself_is_never_chmodded(self) -> None:
+        index_dir = self.tmp / "shared"
+        index_dir.mkdir()
+        os.chmod(index_dir, 0o755)
+
+        IndexStore(index_dir / INDEX_SUBDIR / "test.sqlite").close()
+
+        self.assertEqual(stat.S_IMODE(index_dir.stat().st_mode), 0o755)
+
+    def test_index_file_outside_the_dedicated_folder_is_refused(self) -> None:
+        index_dir = self.tmp / "shared"
+        index_dir.mkdir()
+        os.chmod(index_dir, 0o755)
+
+        with self.assertRaisesRegex(StoreError, INDEX_SUBDIR):
+            IndexStore(index_dir / "test.sqlite")
+
+        self.assertEqual(stat.S_IMODE(index_dir.stat().st_mode), 0o755)
+        self.assertFalse((index_dir / "test.sqlite").exists())
+
+    def test_db_file_is_private_before_sqlite_opens_it(self) -> None:
+        db = self.tmp / "index" / INDEX_SUBDIR / "test.sqlite"
+        modes: list[int] = []
+        connect = sqlite3.connect
+
+        def recording_connect(path, *args, **kwargs):
+            modes.append(stat.S_IMODE(os.stat(path).st_mode))
+            return connect(path, *args, **kwargs)
+
+        old_umask = os.umask(0o022)
+
+        try:
+            with patch.object(store.sqlite3, "connect", recording_connect):
+                IndexStore(db).close()
+        finally:
+            os.umask(old_umask)
+
+        self.assertEqual(modes, [0o600])
+
+    def test_remove_sidecars_leaves_the_database(self) -> None:
+        db = self.tmp / "x.sqlite"
+        db.write_bytes(b"db")
+
+        for suffix in ("-journal", "-wal", "-shm"):
+            Path(f"{db}{suffix}").write_bytes(b"stale")
+
+        remove_sidecars(db)
+        remove_sidecars(db)  # nothing left to remove is fine
+
+        self.assertEqual(sorted(path.name for path in self.tmp.iterdir()), ["x.sqlite"])
+
+
+class IndexLocationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp)
+
+    def test_index_dir_inside_the_repo_is_refused(self) -> None:
+        for index_dir in (REPO_ROOT, REPO_ROOT / "data" / "index"):
+            with self.subTest(index_dir=index_dir):
+                with self.assertRaisesRegex(StoreError, "inside the repository"):
+                    index_path_for(str(self.tmp / "notes"), str(index_dir))
+
+    def test_relative_index_dir_resolving_into_the_repo_is_refused(self) -> None:
+        with self.assertRaisesRegex(StoreError, "inside the repository"):
+            index_path_for(str(self.tmp / "notes"), str(REPO_ROOT / "tests" / ".." / "data"))
+
+    def test_index_dir_inside_the_source_folder_is_refused(self) -> None:
+        notes = self.tmp / "notes"
+
+        for index_dir in (notes, notes / ".index"):
+            with self.subTest(index_dir=index_dir):
+                with self.assertRaisesRegex(StoreError, "inside DATA_SOURCE_DIR"):
+                    index_path_for(str(notes), str(index_dir))
+
+    def test_index_dir_next_to_the_source_folder_is_allowed(self) -> None:
+        path = index_path_for(str(self.tmp / "notes"), str(self.tmp / "notes-index"))
+
+        self.assertEqual(path.parent, self.tmp.resolve() / "notes-index" / INDEX_SUBDIR)
+
+
+class EmbeddingTextTests(unittest.TestCase):
+    def test_title_is_prefixed_to_a_heading_that_lacks_it(self) -> None:
+        self.assertEqual(embedding_text("Metis", "Storage", "x"), "Metis › Storage\n\nx")
+
+    def test_title_is_not_repeated_when_the_heading_path_starts_with_it(self) -> None:
+        self.assertEqual(embedding_text("Metis", "Metis › Storage", "x"), "Metis › Storage\n\nx")
+        self.assertEqual(embedding_text("Metis", "Metis", "x"), "Metis\n\nx")
+
+    def test_heading_that_only_shares_a_prefix_keeps_the_title(self) -> None:
+        self.assertEqual(embedding_text("Metis", "Metis notes", "x"), "Metis › Metis notes\n\nx")
+
+    def test_note_without_headings_uses_the_title(self) -> None:
+        self.assertEqual(embedding_text("Metis", "", "x"), "Metis\n\nx")
 
 
 class IngestTests(IndexTestCase):
@@ -215,9 +315,30 @@ class IngestTests(IndexTestCase):
         self.assertIn("reading/deep-work.md", self.store.file_hashes())
 
     def test_index_file_is_private_to_the_user(self) -> None:
-        mode = stat.S_IMODE((self.tmp / "index" / "test.sqlite").stat().st_mode)
+        mode = stat.S_IMODE(self.db.stat().st_mode)
 
         self.assertEqual(mode, 0o600)
+
+    def test_embedded_text_does_not_repeat_the_title(self) -> None:
+        self.ingest()
+        texts = [text for call in self.embedder.calls for text in call]
+        storage = next(text for text in texts if "sqlite-vec" in text)
+
+        self.assertTrue(storage.startswith("Metis architecture decisions › Storage\n\n"), storage)
+        self.assertFalse(any(text.startswith("Metis architecture decisions › Metis") for text in texts))
+
+    def test_note_with_byte_order_mark_keeps_frontmatter_and_headings(self) -> None:
+        note = self.vault / "bom.md"
+        note.write_bytes(b"\xef\xbb\xbf---\ntitle: Boat log\n---\n# Engine\n\nOil changed at 200 hours.\n")
+        self.ingest()
+        texts = [text for call in self.embedder.calls for text in call]
+        hit = self.search("oil changed engine hours")[0]
+
+        self.assertEqual(hit.path, "bom.md")
+        self.assertEqual(hit.heading, "Engine")
+        self.assertEqual(hit.text, "Oil changed at 200 hours.")
+        self.assertIn("Boat log › Engine\n\nOil changed at 200 hours.", texts)
+        self.assertFalse(any("\ufeff" in text or "title:" in text for text in texts))
 
     def test_search_on_empty_index_returns_nothing(self) -> None:
         self.assertEqual(self.search("anything"), [])

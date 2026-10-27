@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import importlib
 import math
+import os
 from pathlib import Path
 import re
 from unittest.mock import patch
@@ -46,3 +49,20 @@ def unreadable_file(target: Path):
         return read_bytes(path)
 
     return patch.object(Path, "read_bytes", fake_read_bytes)
+
+
+@contextlib.contextmanager
+def with_proxy_environment(proxy: str):
+    """Rebuild local_http.OPENER while HTTP(S)_PROXY is set, as if the process
+    had started with it; restore the normal opener afterwards."""
+    import local_http
+
+    names = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY")
+
+    try:
+        with patch.dict(os.environ, {name: proxy for name in names}):
+            importlib.reload(local_http)
+            yield
+    finally:
+        importlib.reload(local_http)
+

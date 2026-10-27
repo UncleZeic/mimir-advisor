@@ -213,3 +213,6 @@ __marimo__/
 # Local runtime state and private data
 data/*
 !data/.gitkeep
+
+# Indexes hold note text; they belong outside the repo, never in it
+*.sqlite*

@@ -3,6 +3,7 @@
 .env.*
 !.env.template
 data/
+*.sqlite*
 .venv/
 .git/
 .claude/

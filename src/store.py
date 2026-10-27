@@ -11,6 +11,12 @@ import sqlite3
 
 import sqlite_vec
 
+# Index files live in this dedicated folder under INDEX_DIR. Only this folder
+# is ever chmodded, so pointing INDEX_DIR at an existing directory is safe.
+INDEX_SUBDIR = "mimir-advisor-index"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
+
 
 class StoreError(RuntimeError):
     pass
@@ -28,23 +34,52 @@ def index_path_for(source_dir: str, index_dir: str) -> Path:
     """Each source folder gets its own index, so searching the fixtures can
     never return chunks from a real vault that was ingested separately."""
     source = Path(source_dir).expanduser().resolve()
+    base = Path(index_dir).expanduser().resolve()
+
+    # Indexes hold note text: inside the repo they can be committed or copied
+    # into a Docker image, inside the vault they get synced along with it.
+    for label, forbidden in (("the repository", REPO_ROOT), ("DATA_SOURCE_DIR", source)):
+        if base.is_relative_to(forbidden):
+            raise StoreError(
+                f"INDEX_DIR {base} is inside {label} ({forbidden}). "
+                "Indexes contain note text; point INDEX_DIR somewhere else, "
+                "e.g. ~/.local/share/mimir-advisor/index."
+            )
+
     digest = hashlib.sha1(str(source).encode("utf-8")).hexdigest()[:10]
     name = re.sub(r"[^A-Za-z0-9_-]+", "-", source.name).strip("-") or "root"
-    return Path(index_dir).expanduser() / f"{name}-{digest}.sqlite"
+    return base / INDEX_SUBDIR / f"{name}-{digest}.sqlite"
+
+
+def temporary_path(path: Path) -> Path:
+    """Where `ingest --rebuild` builds the new index before swapping it in."""
+    return path.with_name(f"{path.name}.tmp")
+
+
+def remove_sidecars(path: Path) -> None:
+    """A leftover journal next to a database is replayed into it on open, so
+    one from an old or crashed file must never meet a new file of that name."""
+    for suffix in SIDECAR_SUFFIXES:
+        Path(f"{path}{suffix}").unlink(missing_ok=True)
 
 
 class IndexStore:
     def __init__(self, path: Path) -> None:
+        if path.parent.name != INDEX_SUBDIR:
+            raise StoreError(f"Index files must live in a '{INDEX_SUBDIR}' folder, not {path.parent}")
+
         self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.parent.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(exist_ok=True, mode=0o700)
         # Every open, not only on create: an index dir or file made by an older
         # version, another tool or a loose umask still holds note text.
         os.chmod(path.parent, 0o700)
+        # Create the file 0600 ourselves; sqlite3 would create it 0644 & ~umask.
+        os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+        os.chmod(path, 0o600)
         self.conn = sqlite3.connect(path)
 
         try:
-            os.chmod(path, 0o600)
-
             self.conn.enable_load_extension(True)
             sqlite_vec.load(self.conn)
             self.conn.enable_load_extension(False)

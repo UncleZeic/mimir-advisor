@@ -55,6 +55,12 @@ class FrontmatterTests(unittest.TestCase):
         self.assertEqual(frontmatter, "")
         self.assertTrue(body.startswith("---\ntitle: x"))
 
+    def test_byte_order_mark_before_frontmatter_is_ignored(self) -> None:
+        frontmatter, body = split_frontmatter("\ufeff---\ntitle: Boat log\n---\nBody\n")
+
+        self.assertEqual(note_title(frontmatter, "fallback"), "Boat log")
+        self.assertEqual(body, "Body\n")
+
     def test_frontmatter_with_list_values(self) -> None:
         frontmatter, body = split_frontmatter("---\ntitle: x\ntags:\n  - a\n- b\n---\nBody\n")
 
@@ -123,6 +129,44 @@ class ChunkMarkdownTests(unittest.TestCase):
         self.assertEqual(chunk_markdown(""), [])
         self.assertEqual(chunk_markdown("# Title\n\n## Empty section\n"), [])
         self.assertEqual(chunk_markdown("---\ntitle: x\n---\n"), [])
+
+    def test_max_chars_not_above_overlap_raises_instead_of_looping(self) -> None:
+        for max_chars in (0, 150):
+            with self.subTest(max_chars=max_chars):
+                with self.assertRaises(ValueError):
+                    chunk_markdown("word " * 100, max_chars=max_chars, overlap=150)
+
+    def test_shorter_fence_inside_a_longer_one_does_not_close_it(self) -> None:
+        text = "# Doc\n\n````md\n```\n# not a heading\n```\n````\n\n## After\n\nafter text\n"
+        chunks = chunk_markdown(text)
+
+        self.assertEqual([chunk.heading for chunk in chunks], ["Doc", "Doc › After"])
+        self.assertIn("# not a heading", chunks[0].text)
+
+    def test_other_fence_character_does_not_close_the_fence(self) -> None:
+        text = "# Doc\n\n```\n~~~\n# still code\n```\n\n## After\n\nafter text\n"
+        chunks = chunk_markdown(text)
+
+        self.assertEqual([chunk.heading for chunk in chunks], ["Doc", "Doc › After"])
+        self.assertIn("# still code", chunks[0].text)
+
+    def test_longer_closing_fence_closes(self) -> None:
+        text = "# Doc\n\n~~~\ncode\n~~~~~\n\n## After\n\nafter text\n"
+
+        self.assertEqual([chunk.heading for chunk in chunk_markdown(text)], ["Doc", "Doc › After"])
+
+    def test_unclosed_fence_does_not_leak_into_the_next_note(self) -> None:
+        unclosed = chunk_markdown("# Broken\n\n```\n# inside the fence\n")
+        next_note = chunk_markdown("# Next\n\nbody\n\n## Section\n\nmore\n")
+
+        self.assertEqual([chunk.heading for chunk in unclosed], ["Broken"])
+        self.assertIn("# inside the fence", unclosed[0].text)
+        self.assertEqual([chunk.heading for chunk in next_note], ["Next", "Next › Section"])
+
+    def test_byte_order_mark_does_not_hide_the_first_heading(self) -> None:
+        chunks = chunk_markdown("\ufeff# Title\n\nbody\n")
+
+        self.assertEqual([(chunk.heading, chunk.text) for chunk in chunks], [("Title", "body")])
 
     def test_windows_line_endings(self) -> None:
         chunks = chunk_markdown("# T\r\n\r\nline one\r\nline two\r\n")

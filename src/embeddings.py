@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 from typing import Protocol
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from local_http import urlopen
 
 
 class EmbeddingError(RuntimeError):

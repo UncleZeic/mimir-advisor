@@ -11,6 +11,12 @@ class DockerignoreTests(unittest.TestCase):
         self.assertIn(".env", entries)
         self.assertIn("data/", entries)
 
+    def test_index_files_are_never_committed_or_copied_into_images(self) -> None:
+        for name in (".gitignore", ".dockerignore"):
+            with self.subTest(file=name):
+                lines = (ROOT / name).read_text(encoding="utf-8").splitlines()
+                self.assertIn("*.sqlite*", {line.strip() for line in lines})
+
 
 if __name__ == "__main__":
     unittest.main()
