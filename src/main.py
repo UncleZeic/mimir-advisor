@@ -15,7 +15,6 @@ from ollama_models import RemoteModelError, ensure_local_model, fetch_tags, find
 
 import os
 from pathlib import Path
-import re
 import sqlite3
 import sys
 
@@ -42,7 +41,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # .env in a parent folder could silently set DATA_SOURCE_DIR or INDEX_DIR.
 DOTENV_PATH = REPO_ROOT / ".env"
 DEFAULT_DATA_SOURCE_DIR = "./tests/fixtures/vault"
-THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
 LOCAL_OLLAMA_HOSTS = ("localhost", "127.0.0.1", "::1", "host.docker.internal")
 # Only Docker maps host.docker.internal (via extra_hosts). On the host the name
 # goes to DNS, where resolv.conf search domains can turn it into a real,
@@ -86,7 +84,7 @@ class HealthCheck:
 def load_settings() -> Settings:
     load_dotenv(DOTENV_PATH)
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    model_name = os.getenv("MODEL_NAME", "qwen3:8b")
+    model_name = os.getenv("MODEL_NAME", "gemma4:12b")
     embed_model = os.getenv("EMBED_MODEL", "bge-m3")
     chunk_max_chars = int(os.getenv("CHUNK_MAX_CHARS", "1200"))
     check_ollama_base_url(ollama_base_url)
@@ -260,7 +258,6 @@ def ask_ollama(settings: Settings, prompt: str) -> str:
     payload = {
         "model": settings.model_name,
         "stream": False,
-        "think": False,
         "messages": [
             {
                 "role": "system",
@@ -283,12 +280,7 @@ def ask_ollama(settings: Settings, prompt: str) -> str:
     with urlopen(request, timeout=settings.chat_timeout_seconds) as response:
         body = json.loads(response.read().decode("utf-8"))
 
-    return strip_think(body.get("message", {}).get("content", ""))
-
-
-def strip_think(text: str) -> str:
-    """Older Ollama versions ignore "think" and inline the reasoning instead."""
-    return THINK_BLOCK.sub("", text).strip()
+    return body.get("message", {}).get("content", "").strip()
 
 
 def run_chat_command(settings: Settings, prompt: str | None = None) -> int:

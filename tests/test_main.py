@@ -44,7 +44,7 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.project_name, "mimir-advisor")
         self.assertEqual(settings.persona, "Adjutant_Mimir")
-        self.assertEqual(settings.model_name, "qwen3:8b")
+        self.assertEqual(settings.model_name, "gemma4:12b")
         self.assertEqual(settings.embed_model, "bge-m3")
         self.assertEqual(settings.ollama_base_url, "http://localhost:11434")
         self.assertEqual(settings.data_source_dir, "./tests/fixtures/vault")
@@ -223,7 +223,7 @@ class SettingsTests(unittest.TestCase):
         read = set(re.findall(r'os\.getenv\("([A-Z0-9_]+)"', source)) - {"XDG_DATA_HOME"}
 
         self.assertEqual(read - listed, set())
-        self.assertIn("MODEL_NAME=qwen3:8b\n", template)
+        self.assertIn("MODEL_NAME=gemma4:12b\n", template)
 
 
 class LocalHttpTests(unittest.TestCase):
@@ -301,7 +301,7 @@ class HealthCheckTests(unittest.TestCase):
         self.assertEqual(check.detail, "request timed out")
 
     def test_health_checks_report_installed_and_missing_models(self) -> None:
-        tags = b'{"models": [{"name": "llama3:latest"}, {"name": "other:7b"}]}'
+        tags = b'{"models": [{"name": "gemma4:12b"}, {"name": "other:7b"}]}'
 
         with patch.object(main, "urlopen", side_effect=[UrlopenResponse(200), UrlopenResponse(200, tags)]):
             checks = main.run_health_checks(make_settings())
@@ -316,7 +316,7 @@ class HealthCheckTests(unittest.TestCase):
 
     def test_health_check_refuses_an_installed_model_that_runs_remotely(self) -> None:
         tags = (
-            b'{"models": [{"name": "llama3:latest", "remote_model": "gpt-oss:120b",'
+            b'{"models": [{"name": "gemma4:12b", "remote_model": "gpt-oss:120b",'
             b' "remote_host": "https://ollama.com:443"}, {"name": "bge-m3:latest"}]}'
         )
 
@@ -328,7 +328,7 @@ class HealthCheckTests(unittest.TestCase):
             ("Chat model", False),
             ("Embedding model", True),
         ])
-        self.assertIn("refused: 'llama3' is served from https://ollama.com:443", checks[1].detail)
+        self.assertIn("refused: 'gemma4:12b' is served from https://ollama.com:443", checks[1].detail)
 
     def test_model_checks_fail_when_ollama_is_down(self) -> None:
         with patch.object(main, "urlopen", side_effect=URLError("connection refused")):
@@ -420,12 +420,12 @@ class ChatTests(unittest.TestCase):
 
         self.assertEqual(answer, "No source data is available yet.")
         self.assertEqual(request.full_url, "http://ollama:11434/api/chat")
-        self.assertEqual(payload["model"], "llama3")
+        self.assertEqual(payload["model"], "gemma4:12b")
         self.assertFalse(payload["stream"])
         self.assertEqual(payload["messages"][-1], {"role": "user", "content": "What do you know?"})
 
     def test_ask_ollama_checks_the_model_before_sending_the_prompt(self) -> None:
-        tags = UrlopenResponse(200, b'{"models": [{"name": "llama3:latest"}]}')
+        tags = UrlopenResponse(200, b'{"models": [{"name": "gemma4:12b"}]}')
         reply = UrlopenResponse(200, b'{"message": {"content": "ok"}}')
 
         with patch.object(main, "urlopen", side_effect=[tags, reply]) as urlopen:
@@ -435,7 +435,7 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(urls, ["http://ollama:11434/api/tags", "http://ollama:11434/api/chat"])
 
     def test_ask_ollama_never_sends_a_prompt_to_a_remote_model(self) -> None:
-        tags = UrlopenResponse(200, b'{"models": [{"name": "llama3:latest", "remote_host": "https://ollama.com:443"}]}')
+        tags = UrlopenResponse(200, b'{"models": [{"name": "gemma4:12b", "remote_host": "https://ollama.com:443"}]}')
 
         with patch.object(main, "urlopen", side_effect=[tags]) as urlopen:
             with self.assertRaises(main.RemoteModelError):
@@ -465,7 +465,7 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn("Chat request failed", stderr.getvalue())
 
-    def test_ask_ollama_disables_thinking(self) -> None:
+    def test_ask_ollama_sends_no_think_field(self) -> None:
         response = UrlopenResponse(200, b'{"message": {"content": "ok"}}')
 
         with patch.object(main, "urlopen", return_value=response) as urlopen:
@@ -473,36 +473,10 @@ class ChatTests(unittest.TestCase):
 
         payload = json_from_request(urlopen.call_args.args[0])
 
-        self.assertIs(payload["think"], False)
+        self.assertNotIn("think", payload)
+        self.assertNotIn("<|think|>", payload["messages"][0]["content"])
 
-    def test_ask_ollama_strips_think_block(self) -> None:
-        response = UrlopenResponse(
-            200,
-            b'{"message": {"content": "<think>\\nLet me reason.\\nStill thinking.\\n</think>\\n\\nThe answer."}}',
-        )
-
-        with patch.object(main, "urlopen", return_value=response):
-            answer = main.ask_ollama(self._settings(), "hi")
-
-        self.assertEqual(answer, "The answer.")
-
-    def test_ask_ollama_strips_single_line_think_block(self) -> None:
-        response = UrlopenResponse(200, b'{"message": {"content": "<think>quick thought</think>The answer."}}')
-
-        with patch.object(main, "urlopen", return_value=response):
-            answer = main.ask_ollama(self._settings(), "hi")
-
-        self.assertEqual(answer, "The answer.")
-
-    def test_strip_think_removes_every_block_and_keeps_the_rest(self) -> None:
-        text = "<think>a</think>First.\n<think>\nb\nc\n</think>\nSecond."
-
-        self.assertEqual(main.strip_think(text), "First.\n\nSecond.")
-
-    def test_strip_think_leaves_text_without_think_block_unchanged(self) -> None:
-        self.assertEqual(main.strip_think("No reasoning here."), "No reasoning here.")
-
-    def test_ask_ollama_leaves_answer_without_think_block_unchanged(self) -> None:
+    def test_ask_ollama_returns_the_answer_unchanged(self) -> None:
         response = UrlopenResponse(200, b'{"message": {"content": "Plain answer, no reasoning."}}')
 
         with patch.object(main, "urlopen", return_value=response):
@@ -594,7 +568,7 @@ def make_settings() -> main.Settings:
     return main.Settings(
         project_name="mimir-advisor",
         persona="Adjutant_Mimir",
-        model_name="llama3",
+        model_name="gemma4:12b",
         embed_model="bge-m3",
         ollama_base_url="http://ollama:11434",
         data_source_dir="./tests/fixtures/vault",

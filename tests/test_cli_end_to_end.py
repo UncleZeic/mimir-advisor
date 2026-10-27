@@ -28,7 +28,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 EMBEDDER = HashingEmbedder(model="bge-m3")
 
 
-LOCAL_TAGS = [{"name": "qwen3:8b"}, {"name": "bge-m3:latest"}]
+LOCAL_TAGS = [{"name": "gemma4:12b"}, {"name": "bge-m3:latest"}]
 REMOTE = {"remote_model": "gpt-oss:120b", "remote_host": "https://ollama.com:443"}
 
 
@@ -39,6 +39,7 @@ class FakeOllama(BaseHTTPRequestHandler):
     tags: list[dict] = LOCAL_TAGS
     posts: list[str] = []
     embed_raw: bytes | None = None
+    chat_bodies: list[dict] = []
 
     def do_GET(self) -> None:
         self._send({"models": FakeOllama.tags})
@@ -50,8 +51,8 @@ class FakeOllama(BaseHTTPRequestHandler):
         if self.path == "/api/embed" and FakeOllama.embed_raw is not None:
             self._send_raw(FakeOllama.embed_raw)
         elif self.path == "/api/chat":
-            # An Ollama that ignores "think": False and inlines the reasoning.
-            self._send({"message": {"content": "<think>\nhmm\n</think>\n\nLocal answer."}})
+            FakeOllama.chat_bodies.append(body)
+            self._send({"message": {"content": "Local answer.\n"}})
         else:
             self._send({"embeddings": [EMBEDDER.vector(text) for text in body["input"]]})
 
@@ -140,6 +141,7 @@ class CliEndToEndTests(unittest.TestCase):
         FakeOllama.tags = LOCAL_TAGS
         FakeOllama.posts = []
         FakeOllama.embed_raw = None
+        FakeOllama.chat_bodies = []
         self.tmp = tempfile.mkdtemp()
         self.env = {
             "OLLAMA_BASE_URL": f"http://127.0.0.1:{self.server.server_address[1]}",
@@ -326,7 +328,7 @@ class CliEndToEndTests(unittest.TestCase):
         self.assertEqual(RecordingProxy.requests, [])
 
     def test_cloud_embedding_model_never_receives_a_chunk(self) -> None:
-        FakeOllama.tags = [{"name": "qwen3:8b"}, {"name": "bge-m3:latest", **REMOTE}]
+        FakeOllama.tags = [{"name": "gemma4:12b"}, {"name": "bge-m3:latest", **REMOTE}]
 
         code, out = self.run_cli("health")
         self.assertEqual(code, 1)
@@ -342,19 +344,19 @@ class CliEndToEndTests(unittest.TestCase):
         self.assertEqual(FakeOllama.posts, [])
 
     def test_cloud_chat_model_never_receives_a_prompt(self) -> None:
-        FakeOllama.tags = [{"name": "qwen3:8b", **REMOTE}, {"name": "bge-m3:latest"}]
+        FakeOllama.tags = [{"name": "gemma4:12b", **REMOTE}, {"name": "bge-m3:latest"}]
 
         code, out = self.run_cli("chat", "my private question")
 
         self.assertEqual(code, 1)
-        self.assertIn("Chat request failed: 'qwen3:8b' is served from https://ollama.com:443", out)
+        self.assertIn("Chat request failed: 'gemma4:12b' is served from https://ollama.com:443", out)
         self.assertEqual(FakeOllama.posts, [])
 
     def test_model_turned_remote_between_runs_is_caught(self) -> None:
         code, out = self.run_cli("ingest")
         self.assertEqual(code, 0, out)
         FakeOllama.posts.clear()
-        FakeOllama.tags = [{"name": "qwen3:8b"}, {"name": "bge-m3:latest", **REMOTE}]
+        FakeOllama.tags = [{"name": "gemma4:12b"}, {"name": "bge-m3:latest", **REMOTE}]
 
         code, out = self.run_cli("search", "sqlite-vec")
 
@@ -396,11 +398,14 @@ class CliEndToEndTests(unittest.TestCase):
         code, out = self.run_cli("ingest")
         self.assertIn("6 unchanged", out)
 
-    def test_chat_strips_inlined_reasoning(self) -> None:
+    def test_chat_sends_the_default_model_without_think(self) -> None:
         code, out = self.run_cli("chat", "hello")
 
         self.assertEqual(code, 0, out)
         self.assertEqual(out, "Local answer.\n")
+        [body] = FakeOllama.chat_bodies
+        self.assertEqual(body["model"], "gemma4:12b")
+        self.assertNotIn("think", body)
 
     def test_remote_ollama_url_is_refused_before_any_request(self) -> None:
         # .invalid never resolves, and the opener is blocked as well, so even a
