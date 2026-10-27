@@ -16,6 +16,12 @@ import sqlite_vec
 INDEX_SUBDIR = "mimir-advisor-index"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SIDECAR_SUFFIXES = ("-journal", "-wal", "-shm")
+MOUNTS_FILE = "/proc/self/mounts"
+# Filesystems whose files live on, or are synced to, another machine. FUSE is
+# refused wholesale: sshfs, rclone, s3fs and cloud-drive clients all use it.
+REMOTE_FS_TYPES = {
+    "nfs", "nfs4", "cifs", "smb3", "smbfs", "ncpfs", "afs", "ceph", "glusterfs", "9p", "davfs", "fuse",
+}
 
 
 class StoreError(RuntimeError):
@@ -46,9 +52,41 @@ def index_path_for(source_dir: str, index_dir: str) -> Path:
                 "e.g. ~/.local/share/mimir-advisor/index."
             )
 
+    fs_type = filesystem_type(base)
+
+    if fs_type is not None and (fs_type in REMOTE_FS_TYPES or fs_type.startswith("fuse.")):
+        raise StoreError(
+            f"INDEX_DIR {base} is on a {fs_type} filesystem, which can live on or sync to "
+            "another machine. Indexes contain note text; keep them on a local disk."
+        )
+
     digest = hashlib.sha1(str(source).encode("utf-8")).hexdigest()[:10]
     name = re.sub(r"[^A-Za-z0-9_-]+", "-", source.name).strip("-") or "root"
     return base / INDEX_SUBDIR / f"{name}-{digest}.sqlite"
+
+
+def filesystem_type(path: Path) -> str | None:
+    """Type of the mount holding ``path`` (which need not exist yet), from
+    MOUNTS_FILE; None where that is unavailable, e.g. on macOS."""
+    try:
+        with open(MOUNTS_FILE, encoding="utf-8", errors="replace") as mounts:
+            entries = [line.split() for line in mounts]
+    except OSError:
+        return None
+
+    best: tuple[int, str] | None = None
+
+    for fields in entries:
+        if len(fields) < 3:
+            continue
+
+        # Spaces and tabs in mount points are octal-escaped (\040, \011).
+        mount_point = Path(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[1]))
+
+        if path.is_relative_to(mount_point) and (best is None or len(mount_point.parts) >= best[0]):
+            best = (len(mount_point.parts), fields[2])
+
+    return best[1] if best else None
 
 
 def temporary_path(path: Path) -> Path:
@@ -80,6 +118,12 @@ class IndexStore:
         self.conn = sqlite3.connect(path)
 
         try:
+            # Zero freed pages, so a removed note's text and vectors do not
+            # linger in the file. Many builds default to this, not all do.
+            self.conn.execute("PRAGMA secure_delete = ON")
+            # Sorts and statement journals stay in memory instead of spilling
+            # note text into /tmp, where secure_delete does not reach.
+            self.conn.execute("PRAGMA temp_store = MEMORY")
             self.conn.enable_load_extension(True)
             sqlite_vec.load(self.conn)
             self.conn.enable_load_extension(False)

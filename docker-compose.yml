@@ -4,7 +4,8 @@ services:
     container_name: mimir_logic
     env_file: .env
     # Run as the host user so the 0700/0600 index files stay owned by you.
-    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    # No default: a wrong guess (e.g. 1000) would hand the index to another account.
+    user: "${HOST_UID:?set HOST_UID in .env to the output of id -u}:${HOST_GID:?set HOST_GID in .env to the output of id -g}"
     environment:
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       INDEX_DIR: /index

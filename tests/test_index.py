@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -150,6 +151,58 @@ class PermissionTests(unittest.TestCase):
 
         self.assertEqual(modes, [0o600])
 
+    def test_secure_delete_is_on_even_where_sqlite_defaults_it_off(self) -> None:
+        connect = sqlite3.connect
+
+        def connect_with_secure_delete_off(path, *args, **kwargs):
+            conn = connect(path, *args, **kwargs)
+            conn.execute("PRAGMA secure_delete = OFF")
+            return conn
+
+        with patch.object(store.sqlite3, "connect", connect_with_secure_delete_off):
+            index = IndexStore(self.tmp / "index" / INDEX_SUBDIR / "test.sqlite")
+
+        try:
+            self.assertEqual(index.conn.execute("PRAGMA secure_delete").fetchone(), (1,))
+        finally:
+            index.close()
+
+    def test_removed_note_text_and_vectors_do_not_linger_in_the_file(self) -> None:
+        vault = self.tmp / "vault"
+        shutil.copytree(FIXTURES, vault)
+        body = "\n\n".join(f"CANARY-{i} private paragraph, word{i} " * 8 for i in range(20))
+        (vault / "secret.md").write_text("# Secret\n\n" + body, encoding="utf-8")
+        db = self.tmp / "index" / INDEX_SUBDIR / "test.sqlite"
+        embedder = HashingEmbedder()
+        index = IndexStore(db)
+
+        try:
+            ingest_folder(index, embedder, vault, 1200)
+            ids = [row[0] for row in index.conn.execute("SELECT id FROM chunks WHERE path = 'secret.md'")]
+            vectors = [
+                bytes(row[0])
+                for row in index.conn.execute(
+                    f"SELECT embedding FROM vec_chunks WHERE rowid IN ({','.join('?' * len(ids))})", ids
+                )
+            ]
+            (vault / "secret.md").unlink()
+            ingest_folder(index, embedder, vault, 1200)
+        finally:
+            index.close()
+
+        raw = db.read_bytes()
+        self.assertGreater(len(vectors), 1)
+        self.assertNotIn(b"CANARY-", raw)
+        self.assertFalse(any(vector in raw for vector in vectors))
+
+    def test_temporary_data_stays_in_memory(self) -> None:
+        index = IndexStore(self.tmp / "index" / INDEX_SUBDIR / "test.sqlite")
+
+        try:
+            self.assertEqual(index.conn.execute("PRAGMA temp_store").fetchone(), (2,))  # 2 = MEMORY
+        finally:
+            index.close()
+
     def test_remove_sidecars_leaves_the_database(self) -> None:
         db = self.tmp / "x.sqlite"
         db.write_bytes(b"db")
@@ -192,6 +245,53 @@ class IndexLocationTests(unittest.TestCase):
         path = index_path_for(str(self.tmp / "notes"), str(self.tmp / "notes-index"))
 
         self.assertEqual(path.parent, self.tmp.resolve() / "notes-index" / INDEX_SUBDIR)
+
+
+class RemoteFilesystemTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.mounts = self.tmp / "mounts"
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp)
+
+    def with_mounts(self, *entries: tuple[str, str]):
+        lines = [f"dev {point} {fs_type} rw 0 0" for point, fs_type in entries]
+        self.mounts.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return patch.object(store, "MOUNTS_FILE", str(self.mounts))
+
+    def test_index_dir_on_a_network_or_fuse_filesystem_is_refused(self) -> None:
+        for fs_type in ("nfs", "nfs4", "cifs", "smb3", "fuse.sshfs", "fuse.rclone", "fuse", "9p"):
+            with self.subTest(fs_type=fs_type), self.with_mounts(("/", "ext4"), ("/mnt/share", fs_type)):
+                with self.assertRaisesRegex(StoreError, f"on a {re.escape(fs_type)} filesystem"):
+                    index_path_for("/notes", "/mnt/share/mimir/index")
+
+    def test_index_dir_on_a_local_filesystem_is_allowed(self) -> None:
+        for fs_type in ("ext4", "zfs", "btrfs", "xfs", "tmpfs", "overlay", "fuseblk"):
+            with self.subTest(fs_type=fs_type), self.with_mounts(("/", "nfs"), ("/home", fs_type)):
+                self.assertEqual(
+                    index_path_for("/notes", "/home/me/.local/share/mimir-advisor/index").parent.name,
+                    INDEX_SUBDIR,
+                )
+
+    def test_the_most_specific_mount_wins(self) -> None:
+        with self.with_mounts(("/", "ext4"), ("/home", "nfs4"), ("/home/me/local", "ext4")):
+            self.assertEqual(store.filesystem_type(Path("/home/me/local/x")), "ext4")
+            self.assertEqual(store.filesystem_type(Path("/home/me/other")), "nfs4")
+            self.assertEqual(store.filesystem_type(Path("/homeless")), "ext4")
+
+    def test_later_mount_on_the_same_point_wins(self) -> None:
+        with self.with_mounts(("/", "ext4"), ("/data", "ext4"), ("/data", "fuse.rclone")):
+            self.assertEqual(store.filesystem_type(Path("/data/index")), "fuse.rclone")
+
+    def test_escaped_spaces_in_mount_points(self) -> None:
+        with self.with_mounts(("/", "ext4"), ("/media/My\\040Share", "cifs")):
+            self.assertEqual(store.filesystem_type(Path("/media/My Share/index")), "cifs")
+
+    def test_unreadable_mount_table_skips_the_check(self) -> None:
+        with patch.object(store, "MOUNTS_FILE", str(self.tmp / "missing")):
+            self.assertIsNone(store.filesystem_type(Path("/anywhere")))
+            index_path_for("/notes", "/anywhere/index")
 
 
 class EmbeddingTextTests(unittest.TestCase):

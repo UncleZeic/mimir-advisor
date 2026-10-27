@@ -1,2 +1,2 @@
-python-dotenv
-sqlite-vec
+python-dotenv==1.2.3
+sqlite-vec==0.1.9

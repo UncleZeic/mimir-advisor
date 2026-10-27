@@ -1,3 +1,4 @@
+import contextlib
 import io
 import os
 import re
@@ -66,7 +67,12 @@ class SettingsTests(unittest.TestCase):
             "OLLAMA_EMBED_TIMEOUT_SECONDS": "90",
         }
 
-        with patch.dict(os.environ, env, clear=True), patch.object(main, "load_dotenv"):
+        with (
+            patch.dict(os.environ, env, clear=True),
+            patch.object(main, "load_dotenv"),
+            patch.object(main, "running_in_container", return_value=True),
+            patch.object(main, "hosts_file_address", return_value="172.17.0.1"),
+        ):
             settings = main.load_settings()
 
         self.assertEqual(settings.project_name, "custom-advisor")
@@ -99,11 +105,77 @@ class SettingsTests(unittest.TestCase):
             "http://localhost:11434",
             "http://127.0.0.1:11434/",
             "http://[::1]:11434",
-            "http://host.docker.internal:11434",
             "https://LOCALHOST:11434",
         ):
             with self.subTest(url=url):
                 self.assertEqual(load_with({"OLLAMA_BASE_URL": url}).ollama_base_url, url)
+
+    def test_host_docker_internal_is_accepted_only_inside_a_container(self) -> None:
+        env = {"OLLAMA_BASE_URL": "http://host.docker.internal:11434"}
+
+        with with_hosts_file("172.17.0.1 host.docker.internal\n"):
+            with patch.object(main, "running_in_container", return_value=True):
+                self.assertEqual(load_with(env).ollama_base_url, env["OLLAMA_BASE_URL"])
+
+            with patch.object(main, "running_in_container", return_value=False):
+                with self.assertRaisesRegex(main.SettingsError, "only resolves safely inside Docker"):
+                    load_with(env)
+
+    def test_host_docker_internal_must_come_from_the_hosts_file(self) -> None:
+        env = {"OLLAMA_BASE_URL": "http://host.docker.internal:11434"}
+        refused = (
+            "127.0.0.1 localhost\n",                      # plain docker run: not mapped, DNS would answer
+            "# 172.17.0.1 host.docker.internal\n",        # commented out
+            "8.8.8.8 host.docker.internal\n",             # mapped, but to a public address
+            "not-an-ip host.docker.internal\n",
+        )
+
+        with patch.object(main, "running_in_container", return_value=True):
+            for hosts in refused:
+                with self.subTest(hosts=hosts), with_hosts_file(hosts):
+                    with self.assertRaisesRegex(main.SettingsError, "--add-host=host.docker.internal:host-gateway"):
+                        load_with(env)
+
+            for hosts in (
+                "172.17.0.1\thost.docker.internal\n",
+                "192.168.65.254 gateway HOST.DOCKER.INTERNAL # Docker Desktop\n",
+                "fe80::1 host.docker.internal\n",
+            ):
+                with self.subTest(hosts=hosts), with_hosts_file(hosts):
+                    self.assertEqual(load_with(env).ollama_base_url, env["OLLAMA_BASE_URL"])
+
+    def test_missing_hosts_file_refuses_host_docker_internal(self) -> None:
+        with (
+            patch.object(main, "running_in_container", return_value=True),
+            patch.object(main, "HOSTS_FILE", "/nonexistent/hosts"),
+        ):
+            with self.assertRaises(main.SettingsError):
+                load_with({"OLLAMA_BASE_URL": "http://host.docker.internal:11434"})
+
+    def test_cloud_models_are_refused_in_settings(self) -> None:
+        for variable, model in (("MODEL_NAME", "gpt-oss:120b-cloud"), ("EMBED_MODEL", "embeddinggemma:cloud")):
+            with self.subTest(variable=variable):
+                with self.assertRaisesRegex(main.SettingsError, f"{variable}={model} is an Ollama cloud model"):
+                    load_with({variable: model})
+
+    def test_only_the_repo_env_file_is_loaded(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch.object(main, "load_dotenv") as load_dotenv:
+            main.load_settings()
+
+        load_dotenv.assert_called_once_with(ROOT / ".env")
+        self.assertEqual(main.DOTENV_PATH, ROOT / ".env")
+
+    def test_fallback_env_loader_reads_only_the_given_file(self) -> None:
+        source = (ROOT / "src" / "main.py").read_text(encoding="utf-8")
+
+        self.assertIn("def load_dotenv(env_path) -> None:", source)
+        self.assertNotIn('env_path = ".env"', source)
+
+    def test_running_in_container_checks_docker_and_podman_markers(self) -> None:
+        for present, expected in (({"/.dockerenv"}, True), ({"/run/.containerenv"}, True), (set(), False)):
+            with self.subTest(present=present):
+                with patch.object(main.os.path, "exists", side_effect=lambda path: path in present):
+                    self.assertIs(main.running_in_container(), expected)
 
     def test_non_local_ollama_hosts_are_rejected(self) -> None:
         for url in (
@@ -157,10 +229,22 @@ class SettingsTests(unittest.TestCase):
 class LocalHttpTests(unittest.TestCase):
     def test_opener_ignores_proxy_environment(self) -> None:
         # The opener is built at import, so build it with proxies configured.
-        # build_opener drops the empty ProxyHandler (it handles nothing) and,
-        # because one was passed, skips the default environment-reading one.
         with with_proxy_environment("http://127.0.0.1:9"):
             self.assertFalse(any(isinstance(h, ProxyHandler) for h in local_http.OPENER.handlers))
+
+    def test_opener_has_only_plain_http_handlers(self) -> None:
+        names = sorted(type(handler).__name__ for handler in local_http.OPENER.handlers)
+
+        self.assertEqual(
+            names,
+            ["HTTPDefaultErrorHandler", "HTTPErrorProcessor", "HTTPHandler", "HTTPSHandler", "UnknownHandler"],
+        )
+
+    def test_opener_refuses_file_and_ftp_urls(self) -> None:
+        for url in ("file:///etc/hostname", "ftp://localhost/x"):
+            with self.subTest(url=url):
+                with self.assertRaisesRegex(URLError, "unknown url type"):
+                    local_http.urlopen(url, timeout=1)
 
     def test_every_ollama_call_goes_through_the_one_opener(self) -> None:
         # Not assertIs: other tests reload local_http, which makes a new
@@ -227,7 +311,24 @@ class HealthCheckTests(unittest.TestCase):
             ("Chat model", True),
             ("Embedding model", False),
         ])
+        self.assertEqual(checks[1].detail, "installed, runs locally")
         self.assertIn("ollama pull bge-m3", checks[2].detail)
+
+    def test_health_check_refuses_an_installed_model_that_runs_remotely(self) -> None:
+        tags = (
+            b'{"models": [{"name": "llama3:latest", "remote_model": "gpt-oss:120b",'
+            b' "remote_host": "https://ollama.com:443"}, {"name": "bge-m3:latest"}]}'
+        )
+
+        with patch.object(main, "urlopen", side_effect=[UrlopenResponse(200), UrlopenResponse(200, tags)]):
+            checks = main.run_health_checks(make_settings())
+
+        self.assertEqual([(c.name, c.ok) for c in checks], [
+            ("Ollama", True),
+            ("Chat model", False),
+            ("Embedding model", True),
+        ])
+        self.assertIn("refused: 'llama3' is served from https://ollama.com:443", checks[1].detail)
 
     def test_model_checks_fail_when_ollama_is_down(self) -> None:
         with patch.object(main, "urlopen", side_effect=URLError("connection refused")):
@@ -235,12 +336,11 @@ class HealthCheckTests(unittest.TestCase):
 
         self.assertFalse(any(check.ok for check in checks))
 
-    def test_model_name_matching(self) -> None:
-        installed = {"llama3:latest", "bge-m3:latest", "qwen2.5:7b"}
+    def test_malformed_tag_list_reports_ollama_not_reachable(self) -> None:
+        with patch.object(main, "urlopen", side_effect=[UrlopenResponse(200), UrlopenResponse(200, b"<html>")]):
+            checks = main.run_health_checks(make_settings())
 
-        self.assertTrue(main.model_is_installed("llama3", installed))
-        self.assertTrue(main.model_is_installed("qwen2.5:7b", installed))
-        self.assertFalse(main.model_is_installed("qwen2.5", installed))
+        self.assertEqual([c.detail for c in checks[1:]], ["Ollama not reachable", "Ollama not reachable"])
 
 
 class MainTests(unittest.TestCase):
@@ -323,6 +423,47 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(payload["model"], "llama3")
         self.assertFalse(payload["stream"])
         self.assertEqual(payload["messages"][-1], {"role": "user", "content": "What do you know?"})
+
+    def test_ask_ollama_checks_the_model_before_sending_the_prompt(self) -> None:
+        tags = UrlopenResponse(200, b'{"models": [{"name": "llama3:latest"}]}')
+        reply = UrlopenResponse(200, b'{"message": {"content": "ok"}}')
+
+        with patch.object(main, "urlopen", side_effect=[tags, reply]) as urlopen:
+            main.ask_ollama(self._settings(), "hi")
+
+        urls = [call.args[0].full_url for call in urlopen.call_args_list]
+        self.assertEqual(urls, ["http://ollama:11434/api/tags", "http://ollama:11434/api/chat"])
+
+    def test_ask_ollama_never_sends_a_prompt_to_a_remote_model(self) -> None:
+        tags = UrlopenResponse(200, b'{"models": [{"name": "llama3:latest", "remote_host": "https://ollama.com:443"}]}')
+
+        with patch.object(main, "urlopen", side_effect=[tags]) as urlopen:
+            with self.assertRaises(main.RemoteModelError):
+                main.ask_ollama(self._settings(), "my private question")
+
+        self.assertEqual(urlopen.call_count, 1)
+
+    def test_run_chat_command_reports_a_refused_model(self) -> None:
+        with (
+            patch.object(main, "check_http_endpoint", return_value=main.HealthCheck("Ollama", "u", True, "reachable")),
+            patch.object(main, "ask_ollama", side_effect=main.RemoteModelError("'x' is served from elsewhere")),
+            patch("sys.stderr", io.StringIO()) as stderr,
+        ):
+            exit_code = main.run_chat_command(self._settings(), "hello")
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("Chat request failed: 'x' is served from elsewhere", stderr.getvalue())
+
+    def test_run_chat_command_reports_malformed_replies(self) -> None:
+        with (
+            patch.object(main, "check_http_endpoint", return_value=main.HealthCheck("Ollama", "u", True, "reachable")),
+            patch.object(main, "urlopen", return_value=UrlopenResponse(200, b"not json")),
+            patch("sys.stderr", io.StringIO()) as stderr,
+        ):
+            exit_code = main.run_chat_command(self._settings(), "hello")
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("Chat request failed", stderr.getvalue())
 
     def test_ask_ollama_disables_thinking(self) -> None:
         response = UrlopenResponse(200, b'{"message": {"content": "ok"}}')
@@ -432,6 +573,16 @@ class EvalFileTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 main.parse_eval_file(path)
+
+
+@contextlib.contextmanager
+def with_hosts_file(content: str):
+    with tempfile.TemporaryDirectory() as tmp:
+        hosts = Path(tmp) / "hosts"
+        hosts.write_text(content, encoding="utf-8")
+
+        with patch.object(main, "HOSTS_FILE", str(hosts)):
+            yield
 
 
 def load_with(env: dict[str, str]) -> main.Settings:

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from argparse import ArgumentParser
 from dataclasses import dataclass
+import ipaddress
 import json
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request
 
 from local_http import urlopen
+from ollama_models import RemoteModelError, ensure_local_model, fetch_tags, find_entry, is_cloud_name, remote_reason
 
 import os
 from pathlib import Path
@@ -20,9 +22,7 @@ import sys
 try:
     from dotenv import load_dotenv
 except ModuleNotFoundError:
-    def load_dotenv() -> None:
-        env_path = ".env"
-
+    def load_dotenv(env_path) -> None:
         if not os.path.exists(env_path):
             return
 
@@ -37,9 +37,21 @@ except ModuleNotFoundError:
                 os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+# Only the repo's own .env: python-dotenv would otherwise search upwards, so a
+# .env in a parent folder could silently set DATA_SOURCE_DIR or INDEX_DIR.
+DOTENV_PATH = REPO_ROOT / ".env"
 DEFAULT_DATA_SOURCE_DIR = "./tests/fixtures/vault"
 THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
 LOCAL_OLLAMA_HOSTS = ("localhost", "127.0.0.1", "::1", "host.docker.internal")
+# Only Docker maps host.docker.internal (via extra_hosts). On the host the name
+# goes to DNS, where resolv.conf search domains can turn it into a real,
+# remote host such as host.docker.internal.<isp-domain>.
+CONTAINER_ONLY_HOSTS = ("host.docker.internal",)
+CONTAINER_MARKERS = ("/.dockerenv", "/run/.containerenv")
+# Even in a container the name must come from /etc/hosts (compose's
+# extra_hosts: host-gateway); a plain `docker run` would send it to DNS.
+HOSTS_FILE = "/etc/hosts"
 # Must exceed the chunker's 150-char overlap, or hard splits cannot advance.
 MIN_CHUNK_MAX_CHARS = 300
 
@@ -72,10 +84,19 @@ class HealthCheck:
 
 
 def load_settings() -> Settings:
-    load_dotenv()
+    load_dotenv(DOTENV_PATH)
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    model_name = os.getenv("MODEL_NAME", "qwen3:8b")
+    embed_model = os.getenv("EMBED_MODEL", "bge-m3")
     chunk_max_chars = int(os.getenv("CHUNK_MAX_CHARS", "1200"))
     check_ollama_base_url(ollama_base_url)
+
+    for variable, model in (("MODEL_NAME", model_name), ("EMBED_MODEL", embed_model)):
+        if is_cloud_name(model):
+            raise SettingsError(
+                f"{variable}={model} is an Ollama cloud model: it runs on ollama.com, so note text "
+                "would leave this machine. Pick a local model."
+            )
 
     if chunk_max_chars < MIN_CHUNK_MAX_CHARS:
         raise SettingsError(
@@ -86,8 +107,8 @@ def load_settings() -> Settings:
     return Settings(
         project_name=os.getenv("PROJECT_NAME", "mimir-advisor"),
         persona=os.getenv("PERSONA", "Adjutant_Mimir"),
-        model_name=os.getenv("MODEL_NAME", "qwen3:8b"),
-        embed_model=os.getenv("EMBED_MODEL", "bge-m3"),
+        model_name=model_name,
+        embed_model=embed_model,
         ollama_base_url=ollama_base_url,
         # Fixtures by default: anything run without an explicit override only
         # ever sees synthetic notes. Real notes need DATA_SOURCE_DIR on purpose.
@@ -111,6 +132,47 @@ def check_ollama_base_url(url: str) -> None:
             f"OLLAMA_BASE_URL must point at a local Ollama ({', '.join(LOCAL_OLLAMA_HOSTS)}), "
             f"got {url!r}. Note text is never sent to another host."
         )
+
+    if parts.hostname in CONTAINER_ONLY_HOSTS and not running_in_container():
+        raise SettingsError(
+            f"OLLAMA_BASE_URL uses {parts.hostname}, which only resolves safely inside Docker. "
+            "Outside a container use http://localhost:11434."
+        )
+
+    if parts.hostname in CONTAINER_ONLY_HOSTS and not is_private_address(hosts_file_address(parts.hostname)):
+        raise SettingsError(
+            f"OLLAMA_BASE_URL uses {parts.hostname}, but {HOSTS_FILE} does not map it to a private "
+            "address, so it would be looked up in DNS. Run with "
+            f"--add-host={parts.hostname}:host-gateway (compose sets this via extra_hosts)."
+        )
+
+
+def running_in_container() -> bool:
+    return any(os.path.exists(marker) for marker in CONTAINER_MARKERS)
+
+
+def hosts_file_address(name: str) -> str | None:
+    """The first address HOSTS_FILE gives for ``name``, or None."""
+    try:
+        with open(HOSTS_FILE, encoding="utf-8", errors="replace") as hosts:
+            for line in hosts:
+                fields = line.split("#", 1)[0].split()
+
+                if len(fields) >= 2 and name.lower() in (alias.lower() for alias in fields[1:]):
+                    return fields[0]
+    except OSError:
+        return None
+
+    return None
+
+
+def is_private_address(address: str | None) -> bool:
+    try:
+        ip = ipaddress.ip_address(address or "")
+    except ValueError:
+        return False
+
+    return ip.is_private or ip.is_link_local or ip.is_loopback
 
 
 def default_index_dir() -> str:
@@ -136,17 +198,8 @@ def check_http_endpoint(name: str, url: str, timeout: float) -> HealthCheck:
     return HealthCheck(name=name, url=url, ok=False, detail=detail)
 
 
-def installed_ollama_models(settings: Settings) -> set[str]:
-    url = f"{settings.ollama_base_url.rstrip('/')}/api/tags"
-
-    with urlopen(url, timeout=settings.health_timeout_seconds) as response:
-        body = json.loads(response.read().decode("utf-8"))
-
-    return {model.get("name", "") for model in body.get("models", [])}
-
-
-def model_is_installed(model: str, installed: set[str]) -> bool:
-    return model in installed or (":" not in model and f"{model}:latest" in installed)
+def installed_ollama_models(settings: Settings) -> list[dict]:
+    return fetch_tags(settings.ollama_base_url, settings.health_timeout_seconds, urlopen)
 
 
 def run_health_checks(settings: Settings) -> list[HealthCheck]:
@@ -162,8 +215,15 @@ def run_health_checks(settings: Settings) -> list[HealthCheck]:
     for label, model in (("Chat model", settings.model_name), ("Embedding model", settings.embed_model)):
         if installed is None:
             checks.append(HealthCheck(label, model, False, "Ollama not reachable"))
-        elif model_is_installed(model, installed):
-            checks.append(HealthCheck(label, model, True, "installed"))
+            continue
+
+        entry = find_entry(model, installed)
+        reason = remote_reason(model, entry)
+
+        if reason is not None:
+            checks.append(HealthCheck(label, model, False, f"refused: {reason}"))
+        elif entry is not None:
+            checks.append(HealthCheck(label, model, True, "installed, runs locally"))
         else:
             checks.append(HealthCheck(label, model, False, f"missing; run: ollama pull {model}"))
 
@@ -195,6 +255,7 @@ def run_health_command(settings: Settings) -> int:
 
 
 def ask_ollama(settings: Settings, prompt: str) -> str:
+    ensure_local_model(settings.ollama_base_url, settings.model_name, settings.health_timeout_seconds, urlopen)
     url = f"{settings.ollama_base_url.rstrip('/')}/api/chat"
     payload = {
         "model": settings.model_name,
@@ -245,7 +306,7 @@ def run_chat_command(settings: Settings, prompt: str | None = None) -> int:
         try:
             print(ask_ollama(settings, prompt))
             return 0
-        except (HTTPError, URLError, TimeoutError) as error:
+        except (HTTPError, URLError, TimeoutError, ValueError, RemoteModelError) as error:
             print(f"Chat request failed: {error}", file=sys.stderr)
             return 1
 
@@ -266,7 +327,7 @@ def run_chat_command(settings: Settings, prompt: str | None = None) -> int:
 
         try:
             print(ask_ollama(settings, user_input))
-        except (HTTPError, URLError, TimeoutError) as error:
+        except (HTTPError, URLError, TimeoutError, ValueError, RemoteModelError) as error:
             print(f"Chat request failed: {error}", file=sys.stderr)
             return 1
 
@@ -344,6 +405,13 @@ def run_ingest_command(settings: Settings, rebuild: bool = False) -> int:
         where = "" if isinstance(error, (EmbeddingError, StoreError)) else f" (index: {build_path})"
         print(f"Ingest stopped: {error}{where}", file=sys.stderr)
         return 1
+    except BaseException:
+        # Ctrl-C or an unexpected error: still never leave a stray copy of
+        # the notes behind in a half-built side file.
+        if rebuild:
+            discard_index(build_path)
+
+        raise
 
     print(
         f"Done: {report.indexed} indexed ({report.chunks} chunks), "

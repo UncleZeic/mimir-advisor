@@ -1,12 +1,12 @@
-# Never send secrets, private data or local state into the build context.
-.env
-.env.*
-!.env.template
-data/
-*.sqlite*
-.venv/
-.git/
-.claude/
-.obsidian/
-.vscode/
+# Allowlist: the image gets the code and its dependency list, nothing else.
+# Exclusions like `.env` only match at the context root; an allowlist also
+# keeps nested .env files, indexes and private eval files out of image layers.
+*
+!src/
+!requirements.txt
+
+# Belt and braces inside the allowed folders.
 **/__pycache__
+**/.env
+**/.env.*
+**/*.sqlite*

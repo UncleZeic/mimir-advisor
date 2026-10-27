@@ -28,21 +28,37 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 EMBEDDER = HashingEmbedder(model="bge-m3")
 
 
+LOCAL_TAGS = [{"name": "qwen3:8b"}, {"name": "bge-m3:latest"}]
+REMOTE = {"remote_model": "gpt-oss:120b", "remote_host": "https://ollama.com:443"}
+
+
 class FakeOllama(BaseHTTPRequestHandler):
+    """``tags`` is what /api/tags lists; ``posts`` records every POST path, so
+    tests can prove no prompt or chunk was sent; ``embed_raw`` replaces the
+    /api/embed reply with raw bytes."""
+    tags: list[dict] = LOCAL_TAGS
+    posts: list[str] = []
+    embed_raw: bytes | None = None
+
     def do_GET(self) -> None:
-        self._send({"models": [{"name": "qwen3:8b"}, {"name": "bge-m3:latest"}]})
+        self._send({"models": FakeOllama.tags})
 
     def do_POST(self) -> None:
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        FakeOllama.posts.append(self.path)
 
-        if self.path == "/api/chat":
+        if self.path == "/api/embed" and FakeOllama.embed_raw is not None:
+            self._send_raw(FakeOllama.embed_raw)
+        elif self.path == "/api/chat":
             # An Ollama that ignores "think": False and inlines the reasoning.
             self._send({"message": {"content": "<think>\nhmm\n</think>\n\nLocal answer."}})
         else:
             self._send({"embeddings": [EMBEDDER.vector(text) for text in body["input"]]})
 
     def _send(self, payload: dict) -> None:
-        data = json.dumps(payload).encode("utf-8")
+        self._send_raw(json.dumps(payload).encode("utf-8"))
+
+    def _send_raw(self, data: bytes) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -73,11 +89,34 @@ class RecordingProxy(BaseHTTPRequestHandler):
         return None
 
 
+class RedirectingOllama(BaseHTTPRequestHandler):
+    """Something on the Ollama port that bounces every request elsewhere."""
+    target = ""
+
+    def do_GET(self) -> None:
+        self._redirect(302)
+
+    def do_POST(self) -> None:
+        self._redirect(303)
+
+    def _redirect(self, code: int) -> None:
+        self.send_response(code)
+        self.send_header("Location", f"{RedirectingOllama.target}{self.path}")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *args: object) -> None:
+        return None
+
+
 class FailingEmbedder:
     model = "bge-m3"
 
+    def __init__(self, error: BaseException = EmbeddingError("Ollama went away")) -> None:
+        self.error = error
+
     def embed(self, texts: list[str]) -> list[list[float]]:
-        raise EmbeddingError("Ollama went away")
+        raise self.error
 
 
 class CliEndToEndTests(unittest.TestCase):
@@ -85,17 +124,22 @@ class CliEndToEndTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOllama)
         cls.proxy = ThreadingHTTPServer(("127.0.0.1", 0), RecordingProxy)
+        cls.redirector = ThreadingHTTPServer(("127.0.0.1", 0), RedirectingOllama)
+        RedirectingOllama.target = f"http://127.0.0.1:{cls.proxy.server_address[1]}"
 
-        for server in (cls.server, cls.proxy):
+        for server in (cls.server, cls.proxy, cls.redirector):
             threading.Thread(target=server.serve_forever, daemon=True).start()
 
     @classmethod
     def tearDownClass(cls) -> None:
-        for server in (cls.server, cls.proxy):
+        for server in (cls.server, cls.proxy, cls.redirector):
             server.shutdown()
             server.server_close()
 
     def setUp(self) -> None:
+        FakeOllama.tags = LOCAL_TAGS
+        FakeOllama.posts = []
+        FakeOllama.embed_raw = None
         self.tmp = tempfile.mkdtemp()
         self.env = {
             "OLLAMA_BASE_URL": f"http://127.0.0.1:{self.server.server_address[1]}",
@@ -263,6 +307,94 @@ class CliEndToEndTests(unittest.TestCase):
                 self.assertEqual(code, 0, out)
 
         self.assertEqual(RecordingProxy.requests, [])
+
+    def test_redirects_are_never_followed(self) -> None:
+        self.env["OLLAMA_BASE_URL"] = f"http://127.0.0.1:{self.redirector.server_address[1]}"
+        RecordingProxy.requests.clear()
+
+        code, out = self.run_cli("health")
+        self.assertEqual(code, 1)
+        self.assertIn("[FAIL] Ollama: HTTP 302", out)
+
+        code, out = self.run_cli("ingest")
+        self.assertEqual(code, 1)
+        self.assertIn("Ingest stopped: Cannot list Ollama models: HTTP 302", out)
+
+        code, out = self.run_cli("chat", "hello")
+        self.assertEqual(code, 1)
+
+        self.assertEqual(RecordingProxy.requests, [])
+
+    def test_cloud_embedding_model_never_receives_a_chunk(self) -> None:
+        FakeOllama.tags = [{"name": "qwen3:8b"}, {"name": "bge-m3:latest", **REMOTE}]
+
+        code, out = self.run_cli("health")
+        self.assertEqual(code, 1)
+        self.assertIn("[FAIL] Embedding model: refused: 'bge-m3' is served from https://ollama.com:443", out)
+
+        code, out = self.run_cli("ingest")
+        self.assertEqual(code, 1)
+        self.assertIn("Ingest stopped: 'bge-m3' is served from https://ollama.com:443", out)
+
+        code, out = self.run_cli("search", "anything")
+        self.assertEqual(code, 1)
+
+        self.assertEqual(FakeOllama.posts, [])
+
+    def test_cloud_chat_model_never_receives_a_prompt(self) -> None:
+        FakeOllama.tags = [{"name": "qwen3:8b", **REMOTE}, {"name": "bge-m3:latest"}]
+
+        code, out = self.run_cli("chat", "my private question")
+
+        self.assertEqual(code, 1)
+        self.assertIn("Chat request failed: 'qwen3:8b' is served from https://ollama.com:443", out)
+        self.assertEqual(FakeOllama.posts, [])
+
+    def test_model_turned_remote_between_runs_is_caught(self) -> None:
+        code, out = self.run_cli("ingest")
+        self.assertEqual(code, 0, out)
+        FakeOllama.posts.clear()
+        FakeOllama.tags = [{"name": "qwen3:8b"}, {"name": "bge-m3:latest", **REMOTE}]
+
+        code, out = self.run_cli("search", "sqlite-vec")
+
+        self.assertEqual(code, 1)
+        self.assertIn("served from https://ollama.com:443", out)
+        self.assertEqual(FakeOllama.posts, [])
+
+    def test_cloud_model_name_is_refused_before_any_request(self) -> None:
+        self.env["EMBED_MODEL"] = "embeddinggemma:300m-cloud"
+
+        code, out = self.run_cli("ingest")
+
+        self.assertEqual(code, 2)
+        self.assertIn("Invalid settings: EMBED_MODEL=embeddinggemma:300m-cloud is an Ollama cloud model", out)
+        self.assertEqual(FakeOllama.posts, [])
+
+    def test_malformed_embedding_reply_during_rebuild_is_clean(self) -> None:
+        self.run_cli("ingest")
+        FakeOllama.embed_raw = b"<html>502 Bad Gateway</html>"
+
+        code, out = self.run_cli("ingest", "--rebuild")
+
+        self.assertEqual(code, 1)
+        self.assertIn("Ingest stopped: Ollama returned an invalid embedding response", out)
+        self.assertNotIn("Traceback", out)
+        self.assertEqual(self.index_files(), [self.index_path().name])
+
+    def test_interrupted_rebuild_leaves_no_copy_of_the_notes(self) -> None:
+        self.run_cli("ingest")
+
+        for error in (KeyboardInterrupt(), ValueError("unexpected")):
+            with self.subTest(error=type(error).__name__):
+                with patch.object(main, "make_embedder", return_value=FailingEmbedder(error)):
+                    with self.assertRaises(type(error)):
+                        self.run_cli("ingest", "--rebuild")
+
+                self.assertEqual(self.index_files(), [self.index_path().name])
+
+        code, out = self.run_cli("ingest")
+        self.assertIn("6 unchanged", out)
 
     def test_chat_strips_inlined_reasoning(self) -> None:
         code, out = self.run_cli("chat", "hello")

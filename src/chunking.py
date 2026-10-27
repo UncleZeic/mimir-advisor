@@ -10,10 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
-HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+# Linear-time patterns only: notes can hold pasted text with very long lines,
+# and a nested quantifier like (.+?)\s*#*\s*$ backtracks cubically on them.
+HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(\S.*)$")
 FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 YAML_KEY_RE = re.compile(r"^[\w.-]+\s*:(\s|$)")
-TITLE_RE = re.compile(r"^title:\s*[\"']?(.+?)[\"']?\s*$", re.MULTILINE)
 HEADING_SEPARATOR = " › "
 
 
@@ -65,8 +66,31 @@ def _looks_like_yaml(block: list[str]) -> bool:
 
 
 def note_title(frontmatter: str, fallback: str) -> str:
-    match = TITLE_RE.search(frontmatter)
-    return match.group(1).strip() if match else fallback
+    for line in frontmatter.split("\n"):
+        if not line.startswith("title:"):
+            continue
+
+        value = line[len("title:") :].strip()
+
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1].strip()
+
+        if value:
+            return value
+
+    return fallback
+
+
+def heading_text(raw: str) -> str:
+    """Heading text without an optional closing run of '#' (CommonMark: the
+    run must follow a space or be the whole text, so 'C#' keeps its '#')."""
+    text = raw.rstrip(" \t")
+    without = text.rstrip("#")
+
+    if without != text and (not without or without[-1] in " \t"):
+        text = without.rstrip(" \t")
+
+    return text or raw.strip()
 
 
 def chunk_markdown(text: str, max_chars: int = 1200, overlap: int = 150) -> list[Chunk]:
@@ -122,7 +146,7 @@ def chunk_markdown(text: str, max_chars: int = 1200, overlap: int = 150) -> list
         while stack and stack[-1][0] >= level:
             stack.pop()
 
-        stack.append((level, match.group(2).strip()))
+        stack.append((level, heading_text(match.group(2))))
 
     flush()
     return chunks

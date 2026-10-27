@@ -6,5 +6,18 @@
       "Read(//tank/vault/**)",
       "Read(~/.local/share/mimir-advisor/**)"
     ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyRead": [
+        "./.env",
+        "./data",
+        "/tank/vault",
+        "~/.local/share/mimir-advisor"
+      ]
+    }
   }
 }

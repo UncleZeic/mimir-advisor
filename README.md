@@ -93,6 +93,9 @@ cp .env.template .env
 ollama pull qwen3:8b && ollama pull bge-m3
 ```
 
+Only local models are accepted. Ollama cloud models (tags ending in `-cloud`, or any model
+Ollama lists with a `remote_host`) are refused, because they forward note text to ollama.com.
+
 Check that Ollama and both models are ready:
 
 ```bash
@@ -149,7 +152,9 @@ mkdir -p -m 700 ~/.local/share/mimir-advisor/index
 docker compose run --rm advisor python src/main.py health
 ```
 
-`.dockerignore` keeps `.env`, `data/`, `.venv/`, `.git/` and editor state out of the image.
+`.dockerignore` is an allowlist: only `src/` and `requirements.txt` go into the image,
+so `.env`, `data/`, indexes and editor state never do. `HOST_UID`/`HOST_GID` have no
+default; compose refuses to start without them.
 
 ## Design Intent
 

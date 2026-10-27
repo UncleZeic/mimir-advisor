@@ -1,10 +1,11 @@
+import subprocess
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from chunking import chunk_markdown, note_title, split_frontmatter
+from chunking import chunk_markdown, heading_text, note_title, split_frontmatter
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "vault"
 
@@ -60,6 +61,14 @@ class FrontmatterTests(unittest.TestCase):
 
         self.assertEqual(note_title(frontmatter, "fallback"), "Boat log")
         self.assertEqual(body, "Body\n")
+
+    def test_title_quotes_and_empty_values(self) -> None:
+        self.assertEqual(note_title('title: "Quoted"', "f"), "Quoted")
+        self.assertEqual(note_title("title: 'Single'", "f"), "Single")
+        self.assertEqual(note_title('title: Say "hi"', "f"), 'Say "hi"')
+        self.assertEqual(note_title("title:", "f"), "f")
+        self.assertEqual(note_title('title: ""\ntitle: Second', "f"), "Second")
+        self.assertEqual(note_title("subtitle: no\n  title: nested", "f"), "f")
 
     def test_frontmatter_with_list_values(self) -> None:
         frontmatter, body = split_frontmatter("---\ntitle: x\ntags:\n  - a\n- b\n---\nBody\n")
@@ -167,6 +176,39 @@ class ChunkMarkdownTests(unittest.TestCase):
         chunks = chunk_markdown("\ufeff# Title\n\nbody\n")
 
         self.assertEqual([(chunk.heading, chunk.text) for chunk in chunks], [("Title", "body")])
+
+    def test_closing_hashes_are_stripped_only_after_a_space(self) -> None:
+        self.assertEqual(heading_text("Title ##"), "Title")
+        self.assertEqual(heading_text("Title ##   "), "Title")
+        self.assertEqual(heading_text("C#"), "C#")
+        self.assertEqual(heading_text("F# and C#"), "F# and C#")
+        self.assertEqual(heading_text("##"), "##")
+        self.assertEqual([c.heading for c in chunk_markdown("# Notes on C#\n\nbody\n")], ["Notes on C#"])
+
+    def test_tabs_separate_heading_markers(self) -> None:
+        self.assertEqual([c.heading for c in chunk_markdown("##\tTabbed\n\nbody\n")], ["Tabbed"])
+        self.assertEqual([c.heading for c in chunk_markdown("#hashtag\n\nbody\n")], [""])
+
+    def test_very_long_lines_are_parsed_in_linear_time(self) -> None:
+        # The old heading pattern took ~10s on 2,000 spaces and grew cubically,
+        # the old title pattern quadratically. Run in a subprocess so a
+        # regression fails on the timeout instead of hanging the suite.
+        script = (
+            "import sys; sys.path.insert(0, sys.argv[1])\n"
+            "from chunking import chunk_markdown, note_title, split_frontmatter\n"
+            "pad = ' ' * 200_000\n"
+            "text = f'---\\ntitle: a{pad}b\\n---\\n# a{pad}b\\n\\nbody\\n'\n"
+            "assert chunk_markdown(text)[0].heading == f'a{pad}b'\n"
+            "assert note_title(split_frontmatter(text)[0], 'f') == f'a{pad}b'\n"
+        )
+        src = str(Path(__file__).resolve().parents[1] / "src")
+
+        try:
+            result = subprocess.run([sys.executable, "-c", script, src], capture_output=True, text=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            self.fail("parsing a 200,000-character line took over 10s")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_windows_line_endings(self) -> None:
         chunks = chunk_markdown("# T\r\n\r\nline one\r\nline two\r\n")
