@@ -67,12 +67,12 @@ def index_path_for(source_dir: str, index_dir: str) -> Path:
     return base / INDEX_SUBDIR / f"{name}-{digest}.sqlite"
 
 
-def check_local_filesystem(path: Path) -> None:
+def check_local_filesystem(path: Path, label: str = "INDEX_DIR") -> None:
     fs_type = filesystem_type(path)
 
     if fs_type is not None and (fs_type in REMOTE_FS_TYPES or fs_type.startswith("fuse.")):
         raise StoreError(
-            f"INDEX_DIR {path} is on a {fs_type} filesystem, which can live on or sync to "
+            f"{label} {path} is on a {fs_type} filesystem, which can live on or sync to "
             "another machine. Indexes contain note text; keep them on a local disk."
         )
 
@@ -131,7 +131,7 @@ class IndexStore:
         if resolved.parent != index_dir / INDEX_SUBDIR:
             raise StoreError(f"Index file {resolved} is outside {index_dir / INDEX_SUBDIR}")
 
-        check_local_filesystem(resolved)
+        check_local_filesystem(resolved, "Index file")
 
         self.path = path
         path.parent.parent.mkdir(parents=True, exist_ok=True)
@@ -232,11 +232,6 @@ class IndexStore:
             )
             self._set_meta("embed_model", model)
             self._set_meta("dimensions", str(dimensions))
-        elif int(indexed_dimensions) != dimensions:
-            raise StoreError(
-                f"Embedding size changed ({indexed_dimensions} -> {dimensions}). "
-                "Run ingest with --rebuild."
-            )
 
     def _check_dimensions(self, vectors: list[list[float]]) -> None:
         """Every vector must match the index, or the first one if the index

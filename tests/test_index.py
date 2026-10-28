@@ -287,7 +287,7 @@ class IndexSymlinkTests(unittest.TestCase):
         os.chmod(target, 0o644)
         self.index_dir.mkdir(parents=True)
 
-        def swap_in_link(path: Path) -> None:
+        def swap_in_link(path: Path, label: str) -> None:
             self.db.symlink_to(target)
 
         with patch.object(store, "check_local_filesystem", swap_in_link):
@@ -302,7 +302,7 @@ class IndexSymlinkTests(unittest.TestCase):
         os.chmod(target, 0o755)
         self.index_dir.mkdir(parents=True)
 
-        def swap_in_link(path: Path) -> None:
+        def swap_in_link(path: Path, label: str) -> None:
             self.index_dir.rmdir()
             self.index_dir.symlink_to(target, target_is_directory=True)
 
@@ -416,7 +416,7 @@ class RemoteFilesystemTests(unittest.TestCase):
         (self.tmp / "local").symlink_to(share, target_is_directory=True)
 
         with self.with_mounts(("/", "ext4"), (str(share.resolve()), "nfs4")):
-            with self.assertRaisesRegex(StoreError, "on a nfs4 filesystem"):
+            with self.assertRaisesRegex(StoreError, "^Index file .* is on a nfs4 filesystem"):
                 IndexStore(self.tmp / "local" / INDEX_SUBDIR / "test.sqlite")
 
         self.assertFalse((share / INDEX_SUBDIR).exists())
