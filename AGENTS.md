@@ -6,3 +6,9 @@ Local-first private advisor. See README.md for principles.
 - No network calls except the configured OLLAMA_BASE_URL.
 - Indexes never live inside the repo, also under Docker (host ~/.local/share/mimir-advisor/index mounted at /index).
 - Never commit or push. Show the diff and stop; the human commits.
+
+## Roles
+- Writer (Claude Code): edits code in the main checkout. Every change ships with unittest tests.
+- Reviewer (agy, Codex): works only in `.worktrees/review`. Never edits source or tests.
+  Writes findings to `REVIEW-<tool>.md` in that worktree: file, line, issue, severity, suggested fix.
+- Only the human commits, merges or pushes.

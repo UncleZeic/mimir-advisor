@@ -216,3 +216,9 @@ data/*
 
 # Indexes hold note text; they belong outside the repo, never in it
 *.sqlite*
+
+# Agent worktrees
+.worktrees/
+
+# Agent worktrees
+.worktrees/
