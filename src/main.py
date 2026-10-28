@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 from dataclasses import dataclass
 import ipaddress
 import json
+import math
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request
@@ -86,7 +87,14 @@ def load_settings() -> Settings:
     ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     model_name = os.getenv("MODEL_NAME", "gemma4:12b")
     embed_model = os.getenv("EMBED_MODEL", "bge-m3")
-    chunk_max_chars = int(os.getenv("CHUNK_MAX_CHARS", "1200"))
+    chunk_max_chars = parse_number("CHUNK_MAX_CHARS", os.getenv("CHUNK_MAX_CHARS", "1200"), int)
+    health_timeout_seconds = parse_timeout("HEALTH_TIMEOUT_SECONDS", os.getenv("HEALTH_TIMEOUT_SECONDS", "2"))
+    chat_timeout_seconds = parse_timeout(
+        "OLLAMA_CHAT_TIMEOUT_SECONDS", os.getenv("OLLAMA_CHAT_TIMEOUT_SECONDS", "60")
+    )
+    embed_timeout_seconds = parse_timeout(
+        "OLLAMA_EMBED_TIMEOUT_SECONDS", os.getenv("OLLAMA_EMBED_TIMEOUT_SECONDS", "120")
+    )
     check_ollama_base_url(ollama_base_url)
 
     for variable, model in (("MODEL_NAME", model_name), ("EMBED_MODEL", embed_model)):
@@ -115,10 +123,30 @@ def load_settings() -> Settings:
         # resolve to the current directory, which is usually the repo.
         index_dir=os.getenv("INDEX_DIR") or default_index_dir(),
         chunk_max_chars=chunk_max_chars,
-        health_timeout_seconds=float(os.getenv("HEALTH_TIMEOUT_SECONDS", "2")),
-        chat_timeout_seconds=float(os.getenv("OLLAMA_CHAT_TIMEOUT_SECONDS", "60")),
-        embed_timeout_seconds=float(os.getenv("OLLAMA_EMBED_TIMEOUT_SECONDS", "120")),
+        health_timeout_seconds=health_timeout_seconds,
+        chat_timeout_seconds=chat_timeout_seconds,
+        embed_timeout_seconds=embed_timeout_seconds,
     )
+
+
+def parse_number(variable: str, raw: str, kind: type[int] | type[float]) -> int | float:
+    """A typo in .env must be a settings error naming the variable, not a traceback."""
+    try:
+        return kind(raw)
+    except ValueError:
+        expected = "a whole number" if kind is int else "a number"
+        raise SettingsError(f"{variable} must be {expected}, got {raw!r}.") from None
+
+
+def parse_timeout(variable: str, raw: str) -> float:
+    seconds = parse_number(variable, raw, float)
+
+    # float() also accepts nan and inf, and a timeout of 0 or less never
+    # waits for Ollama to answer.
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise SettingsError(f"{variable} must be a finite number of seconds above 0, got {raw!r}.")
+
+    return seconds
 
 
 def check_ollama_base_url(url: str) -> None:
@@ -490,7 +518,14 @@ def parse_eval_file(path: Path) -> list[tuple[str, str]]:
             raise ValueError(f"{path}:{number}: expected 'question | expected/file.md'")
 
         question, expected = stripped.rsplit("|", 1)
-        cases.append((question.strip(), expected.strip()))
+        question = question.strip()
+        # Hits are vault-relative paths, so ./notes/a.md could never match.
+        expected = expected.strip().removeprefix("./")
+
+        if not question or not expected:
+            raise ValueError(f"{path}:{number}: both the question and the expected file are required")
+
+        cases.append((question, expected))
 
     return cases
 
@@ -500,6 +535,11 @@ def run_eval_command(settings: Settings, eval_file: str, k: int = 5) -> int:
         cases = parse_eval_file(Path(eval_file).expanduser())
     except (OSError, ValueError) as error:
         print(f"Cannot read eval file: {error}", file=sys.stderr)
+        return 1
+
+    if not cases:
+        # 0/0 would read as a passing run.
+        print(f"No questions in {eval_file}", file=sys.stderr)
         return 1
 
     print(f"Evaluating {len(cases)} questions against {Path(settings.data_source_dir).expanduser().resolve()}")
@@ -526,6 +566,15 @@ def run_eval_command(settings: Settings, eval_file: str, k: int = 5) -> int:
     return 0
 
 
+def positive_int(text: str) -> int:
+    value = int(text)
+
+    if value < 1:
+        raise ArgumentTypeError(f"must be at least 1, got {value}")
+
+    return value
+
+
 def build_parser() -> ArgumentParser:
     parser = ArgumentParser(description="mimir-advisor local runtime")
     subparsers = parser.add_subparsers(dest="command")
@@ -540,12 +589,12 @@ def build_parser() -> ArgumentParser:
 
     search_parser = subparsers.add_parser("search", help="print the chunks closest to a question")
     search_parser.add_argument("query", nargs="+", help="what to look for")
-    search_parser.add_argument("-k", type=int, default=5, help="number of results (default 5)")
+    search_parser.add_argument("-k", type=positive_int, default=5, help="number of results (default 5)")
     search_parser.add_argument("--full", action="store_true", help="print whole chunks")
 
     eval_parser = subparsers.add_parser("eval", help="score retrieval against a question file")
     eval_parser.add_argument("eval_file", help="lines of: question | expected/file.md")
-    eval_parser.add_argument("-k", type=int, default=5, help="top-k to count as a hit (default 5)")
+    eval_parser.add_argument("-k", type=positive_int, default=5, help="top-k to count as a hit (default 5)")
 
     return parser
 

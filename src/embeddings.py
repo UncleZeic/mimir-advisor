@@ -10,6 +10,9 @@ from urllib.request import Request
 from local_http import urlopen
 from ollama_models import RemoteModelError, ensure_local_model
 
+# The index stores float32: anything larger, and nan or inf, cannot be stored.
+FLOAT32_MAX = 3.4028234663852886e38
+
 
 class EmbeddingError(RuntimeError):
     pass
@@ -90,4 +93,20 @@ class OllamaEmbedder:
         if not isinstance(embeddings, list) or len(embeddings) != len(batch):
             raise EmbeddingError("Ollama returned an unexpected embedding response")
 
+        if not all(is_vector(vector) for vector in embeddings) or len({len(v) for v in embeddings}) > 1:
+            raise EmbeddingError("Ollama returned malformed embedding vectors")
+
         return embeddings
+
+
+def is_vector(value: object) -> bool:
+    """A non-empty list of finite numbers. bool is an int subclass, so it
+    is excluded by name; the range check also rejects nan and inf."""
+    return (
+        isinstance(value, list)
+        and len(value) > 0
+        and all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) and abs(x) <= FLOAT32_MAX
+            for x in value
+        )
+    )

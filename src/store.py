@@ -52,17 +52,29 @@ def index_path_for(source_dir: str, index_dir: str) -> Path:
                 "e.g. ~/.local/share/mimir-advisor/index."
             )
 
-    fs_type = filesystem_type(base)
+    # Nor the other way round: an INDEX_DIR that holds the notes or the repo
+    # is a shared tree (/, ~, a synced folder), not a place of its own.
+    for label, contained in (("the repository", REPO_ROOT), ("DATA_SOURCE_DIR", source)):
+        if contained.is_relative_to(base):
+            raise StoreError(
+                f"{label} ({contained}) is inside INDEX_DIR {base}. "
+                "Point INDEX_DIR at a folder of its own, e.g. ~/.local/share/mimir-advisor/index."
+            )
 
-    if fs_type is not None and (fs_type in REMOTE_FS_TYPES or fs_type.startswith("fuse.")):
-        raise StoreError(
-            f"INDEX_DIR {base} is on a {fs_type} filesystem, which can live on or sync to "
-            "another machine. Indexes contain note text; keep them on a local disk."
-        )
-
+    check_local_filesystem(base)
     digest = hashlib.sha1(str(source).encode("utf-8")).hexdigest()[:10]
     name = re.sub(r"[^A-Za-z0-9_-]+", "-", source.name).strip("-") or "root"
     return base / INDEX_SUBDIR / f"{name}-{digest}.sqlite"
+
+
+def check_local_filesystem(path: Path) -> None:
+    fs_type = filesystem_type(path)
+
+    if fs_type is not None and (fs_type in REMOTE_FS_TYPES or fs_type.startswith("fuse.")):
+        raise StoreError(
+            f"INDEX_DIR {path} is on a {fs_type} filesystem, which can live on or sync to "
+            "another machine. Indexes contain note text; keep them on a local disk."
+        )
 
 
 def filesystem_type(path: Path) -> str | None:
@@ -106,15 +118,43 @@ class IndexStore:
         if path.parent.name != INDEX_SUBDIR:
             raise StoreError(f"Index files must live in a '{INDEX_SUBDIR}' folder, not {path.parent}")
 
+        # A symlinked index folder or file would put note text wherever the
+        # link points (the vault, the repo, a synced folder), past the checks
+        # index_path_for made on INDEX_DIR, and chmod the link's target.
+        for candidate in (path.parent, path):
+            if candidate.is_symlink():
+                raise StoreError(f"{candidate} is a symlink. Index folders and files must not be links.")
+
+        index_dir = path.parent.parent.resolve()
+        resolved = path.resolve()
+
+        if resolved.parent != index_dir / INDEX_SUBDIR:
+            raise StoreError(f"Index file {resolved} is outside {index_dir / INDEX_SUBDIR}")
+
+        check_local_filesystem(resolved)
+
         self.path = path
         path.parent.parent.mkdir(parents=True, exist_ok=True)
         path.parent.mkdir(exist_ok=True, mode=0o700)
         # Every open, not only on create: an index dir or file made by an older
         # version, another tool or a loose umask still holds note text.
-        os.chmod(path.parent, 0o700)
+        # O_NOFOLLOW and fchmod: a link swapped in after the checks above
+        # fails to open instead of having its target chmodded.
+        dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+        try:
+            os.fchmod(dir_fd, 0o700)
+        finally:
+            os.close(dir_fd)
+
         # Create the file 0600 ourselves; sqlite3 would create it 0644 & ~umask.
-        os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
-        os.chmod(path, 0o600)
+        file_fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+
+        try:
+            os.fchmod(file_fd, 0o600)
+        finally:
+            os.close(file_fd)
+
         self.conn = sqlite3.connect(path)
 
         try:
@@ -198,6 +238,19 @@ class IndexStore:
                 "Run ingest with --rebuild."
             )
 
+    def _check_dimensions(self, vectors: list[list[float]]) -> None:
+        """Every vector must match the index, or the first one if the index
+        has none yet: sqlite-vec would fail on it mid-transaction."""
+        indexed = self.get_meta("dimensions")
+        expected = int(indexed) if indexed is not None else len(vectors[0])
+
+        for vector in vectors:
+            if len(vector) != expected:
+                raise StoreError(
+                    f"Embedding size changed ({expected} -> {len(vector)}). "
+                    "Run ingest with --rebuild."
+                )
+
     def file_hashes(self) -> dict[str, str]:
         return dict(self.conn.execute("SELECT path, hash FROM files"))
 
@@ -209,6 +262,9 @@ class IndexStore:
         vectors: list[list[float]],
         model: str,
     ) -> None:
+        if vectors:
+            self._check_dimensions(vectors)
+
         with self.conn:
             self._delete_chunks(path)
 
@@ -250,8 +306,16 @@ class IndexStore:
         return files, chunks
 
     def search(self, vector: list[float], k: int) -> list[SearchHit]:
-        if self.get_meta("dimensions") is None:
+        indexed_dimensions = self.get_meta("dimensions")
+
+        if indexed_dimensions is None:
             return []
+
+        if len(vector) != int(indexed_dimensions):
+            raise StoreError(
+                f"The query embedding has {len(vector)} dimensions, but this index has "
+                f"{indexed_dimensions}. Run ingest with --rebuild."
+            )
 
         rows = self.conn.execute(
             """

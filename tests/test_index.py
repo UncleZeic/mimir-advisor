@@ -15,7 +15,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import HashingEmbedder, unreadable_file
 from ingest import embedding_text, ingest_folder, iter_markdown_files
 import store
-from store import INDEX_SUBDIR, REPO_ROOT, IndexStore, StoreError, index_path_for, remove_sidecars
+from store import (
+    INDEX_SUBDIR,
+    REPO_ROOT,
+    IndexStore,
+    StoreError,
+    index_path_for,
+    remove_sidecars,
+    temporary_path,
+)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "vault"
 
@@ -216,6 +224,107 @@ class PermissionTests(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in self.tmp.iterdir()), ["x.sqlite"])
 
 
+class IndexSymlinkTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.index_dir = self.tmp / "index" / INDEX_SUBDIR
+        self.db = self.index_dir / "test.sqlite"
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp)
+
+    def test_symlinked_index_subfolder_is_refused(self) -> None:
+        target = self.tmp / "vault"
+        target.mkdir()
+        os.chmod(target, 0o755)
+        self.index_dir.parent.mkdir()
+        self.index_dir.symlink_to(target, target_is_directory=True)
+
+        with self.assertRaisesRegex(StoreError, "is a symlink"):
+            IndexStore(self.db)
+
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_dangling_index_subfolder_symlink_is_refused(self) -> None:
+        target = self.tmp / "not-yet"
+        self.index_dir.parent.mkdir()
+        self.index_dir.symlink_to(target, target_is_directory=True)
+
+        with self.assertRaisesRegex(StoreError, "is a symlink"):
+            IndexStore(self.db)
+
+        self.assertFalse(target.exists())
+
+    def test_symlinked_index_file_is_refused(self) -> None:
+        for db in (self.db, temporary_path(self.db)):
+            with self.subTest(name=db.name):
+                target = self.tmp / f"elsewhere-{db.name}"
+                target.write_bytes(b"not an index")
+                os.chmod(target, 0o644)
+                self.index_dir.mkdir(parents=True, exist_ok=True)
+                db.symlink_to(target)
+
+                with self.assertRaisesRegex(StoreError, "is a symlink"):
+                    IndexStore(db)
+
+                self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+                self.assertEqual(target.read_bytes(), b"not an index")
+
+    def test_dangling_index_file_symlink_is_refused(self) -> None:
+        target = self.tmp / "created-through-link.sqlite"
+        self.index_dir.mkdir(parents=True)
+        self.db.symlink_to(target)
+
+        with self.assertRaisesRegex(StoreError, "is a symlink"):
+            IndexStore(self.db)
+
+        self.assertFalse(target.exists())
+
+    def test_file_swapped_for_a_symlink_after_the_checks_is_not_followed(self) -> None:
+        target = self.tmp / "elsewhere.sqlite"
+        target.write_bytes(b"")
+        os.chmod(target, 0o644)
+        self.index_dir.mkdir(parents=True)
+
+        def swap_in_link(path: Path) -> None:
+            self.db.symlink_to(target)
+
+        with patch.object(store, "check_local_filesystem", swap_in_link):
+            with self.assertRaises(OSError):
+                IndexStore(self.db)
+
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+
+    def test_folder_swapped_for_a_symlink_after_the_checks_is_not_followed(self) -> None:
+        target = self.tmp / "vault"
+        target.mkdir()
+        os.chmod(target, 0o755)
+        self.index_dir.mkdir(parents=True)
+
+        def swap_in_link(path: Path) -> None:
+            self.index_dir.rmdir()
+            self.index_dir.symlink_to(target, target_is_directory=True)
+
+        with patch.object(store, "check_local_filesystem", swap_in_link):
+            with self.assertRaises(OSError):
+                IndexStore(self.db)
+
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o755)
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_symlinked_index_dir_above_the_subfolder_is_allowed(self) -> None:
+        # INDEX_DIR itself may be a link (e.g. ~/.local/share on another disk);
+        # index_path_for resolves and checks it.
+        real = self.tmp / "real-index"
+        real.mkdir()
+        (self.tmp / "linked-index").symlink_to(real, target_is_directory=True)
+
+        IndexStore(self.tmp / "linked-index" / INDEX_SUBDIR / "test.sqlite").close()
+
+        self.assertTrue((real / INDEX_SUBDIR / "test.sqlite").is_file())
+
+
 class IndexLocationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
@@ -240,6 +349,18 @@ class IndexLocationTests(unittest.TestCase):
             with self.subTest(index_dir=index_dir):
                 with self.assertRaisesRegex(StoreError, "inside DATA_SOURCE_DIR"):
                     index_path_for(str(notes), str(index_dir))
+
+    def test_index_dir_holding_the_source_folder_is_refused(self) -> None:
+        for index_dir in (self.tmp, self.tmp / "notes" / ".."):
+            with self.subTest(index_dir=index_dir):
+                with self.assertRaisesRegex(StoreError, r"DATA_SOURCE_DIR \(.*\) is inside INDEX_DIR"):
+                    index_path_for(str(self.tmp / "notes" / "work"), str(index_dir))
+
+    def test_index_dir_holding_the_repo_is_refused(self) -> None:
+        for index_dir in (REPO_ROOT.parent, Path(REPO_ROOT.anchor)):
+            with self.subTest(index_dir=index_dir):
+                with self.assertRaisesRegex(StoreError, r"the repository \(.*\) is inside INDEX_DIR"):
+                    index_path_for(str(self.tmp / "notes"), str(index_dir))
 
     def test_index_dir_next_to_the_source_folder_is_allowed(self) -> None:
         path = index_path_for(str(self.tmp / "notes"), str(self.tmp / "notes-index"))
@@ -287,6 +408,18 @@ class RemoteFilesystemTests(unittest.TestCase):
     def test_escaped_spaces_in_mount_points(self) -> None:
         with self.with_mounts(("/", "ext4"), ("/media/My\\040Share", "cifs")):
             self.assertEqual(store.filesystem_type(Path("/media/My Share/index")), "cifs")
+
+    def test_index_store_checks_the_resolved_location(self) -> None:
+        # The link looks local; where it resolves to is a network share.
+        share = self.tmp / "share"
+        share.mkdir()
+        (self.tmp / "local").symlink_to(share, target_is_directory=True)
+
+        with self.with_mounts(("/", "ext4"), (str(share.resolve()), "nfs4")):
+            with self.assertRaisesRegex(StoreError, "on a nfs4 filesystem"):
+                IndexStore(self.tmp / "local" / INDEX_SUBDIR / "test.sqlite")
+
+        self.assertFalse((share / INDEX_SUBDIR).exists())
 
     def test_unreadable_mount_table_skips_the_check(self) -> None:
         with patch.object(store, "MOUNTS_FILE", str(self.tmp / "missing")):
@@ -381,6 +514,36 @@ class IngestTests(IndexTestCase):
             ingest_folder(self.store, HashingEmbedder(dimensions=128), self.vault, 1200)
 
         self.assertIn("256 -> 128", str(caught.exception))
+
+    def test_vectors_of_mixed_size_are_refused_before_anything_is_written(self) -> None:
+        chunks = [("A", 0, "first"), ("A", 1, "second")]
+
+        with self.assertRaisesRegex(StoreError, "4 -> 3"):
+            self.store.replace_file("a.md", "h", chunks, [[1.0] * 4, [1.0] * 3], "fake-embed")
+
+        self.assertEqual(self.store.stats(), (0, 0))
+        self.assertIsNone(self.store.get_meta("dimensions"))
+
+    def test_vector_not_matching_the_index_keeps_the_old_chunks(self) -> None:
+        self.ingest()
+        before = self.store.stats()
+        chunks = [("A", 0, "first"), ("A", 1, "second")]
+
+        with self.assertRaisesRegex(StoreError, "256 -> 255"):
+            self.store.replace_file(
+                "reading/deep-work.md", "h", chunks, [[1.0] * 256, [1.0] * 255], "fake-embed"
+            )
+
+        self.assertEqual(self.store.stats(), before)
+        self.assertEqual(self.search("focused work shutdown ritual")[0].path, "reading/deep-work.md")
+
+    def test_search_with_a_vector_of_the_wrong_size_raises(self) -> None:
+        self.ingest()
+
+        for size in (128, 257):
+            with self.subTest(size=size):
+                with self.assertRaisesRegex(StoreError, f"{size} dimensions, but this index has 256"):
+                    self.store.search([1.0] * size, 5)
 
     def test_chunk_size_is_recorded_and_a_change_requires_rebuild(self) -> None:
         self.ingest()

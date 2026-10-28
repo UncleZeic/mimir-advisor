@@ -83,6 +83,41 @@ class OllamaEmbedderTests(unittest.TestCase):
                     with self.assertRaisesRegex(EmbeddingError, "invalid|unexpected"):
                         OllamaEmbedder(BASE_URL, "bge-m3", 5).embed(["x"])
 
+    def test_malformed_vectors_are_an_embedding_error(self) -> None:
+        cases = {
+            "empty vector": [[]],
+            "not a list": ["1.0, 2.0"],
+            "null vector": [None],
+            "string element": [[1.0, "2.0"]],
+            "null element": [[1.0, None]],
+            "bool element": [[True, False]],
+            "nested list": [[[1.0], [2.0]]],
+            "nan": [[1.0, float("nan")]],
+            "infinity": [[1.0, float("inf")]],
+            "beyond float32": [[1.0, 1e39]],
+        }
+
+        for name, vectors in cases.items():
+            with self.subTest(name=name):
+                with patch.object(embeddings, "urlopen", side_effect=tags_then(Response({"embeddings": vectors}))):
+                    with self.assertRaisesRegex(EmbeddingError, "malformed embedding vectors"):
+                        OllamaEmbedder(BASE_URL, "bge-m3", 5).embed(["x"])
+
+    def test_vectors_of_different_lengths_are_an_embedding_error(self) -> None:
+        body = {"embeddings": [[1.0, 2.0, 3.0], [1.0, 2.0]]}
+
+        with patch.object(embeddings, "urlopen", side_effect=tags_then(Response(body))):
+            with self.assertRaisesRegex(EmbeddingError, "malformed embedding vectors"):
+                OllamaEmbedder(BASE_URL, "bge-m3", 5).embed(["x", "y"])
+
+    def test_integer_elements_are_accepted(self) -> None:
+        body = {"embeddings": [[1, -2, 0.5], [0, 0, 3]]}
+
+        with patch.object(embeddings, "urlopen", side_effect=tags_then(Response(body))):
+            vectors = OllamaEmbedder(BASE_URL, "bge-m3", 5).embed(["x", "y"])
+
+        self.assertEqual(vectors, [[1, -2, 0.5], [0, 0, 3]])
+
     def test_malformed_model_list_is_an_embedding_error(self) -> None:
         with patch.object(embeddings, "urlopen", return_value=Response(raw=b"<html>")):
             with self.assertRaisesRegex(EmbeddingError, "invalid model list"):

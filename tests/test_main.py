@@ -201,6 +201,53 @@ class SettingsTests(unittest.TestCase):
 
         self.assertEqual(load_with({"CHUNK_MAX_CHARS": "300"}).chunk_max_chars, 300)
 
+    def test_malformed_numbers_name_the_variable(self) -> None:
+        for variable, value in (
+            ("CHUNK_MAX_CHARS", "large"),
+            ("CHUNK_MAX_CHARS", "1200.5"),
+            ("CHUNK_MAX_CHARS", ""),
+            ("HEALTH_TIMEOUT_SECONDS", "2s"),
+            ("OLLAMA_CHAT_TIMEOUT_SECONDS", "one minute"),
+            ("OLLAMA_EMBED_TIMEOUT_SECONDS", ""),
+        ):
+            with self.subTest(variable=variable, value=value):
+                with self.assertRaisesRegex(main.SettingsError, f"^{variable} must be a (whole )?number, got {value!r}"):
+                    load_with({variable: value})
+
+    def test_timeouts_must_be_finite_and_positive(self) -> None:
+        for variable in ("HEALTH_TIMEOUT_SECONDS", "OLLAMA_CHAT_TIMEOUT_SECONDS", "OLLAMA_EMBED_TIMEOUT_SECONDS"):
+            for value in ("0", "-1", "-0.5", "nan", "inf", "-inf"):
+                with self.subTest(variable=variable, value=value):
+                    with self.assertRaisesRegex(main.SettingsError, f"^{variable} must be a finite number of seconds"):
+                        load_with({variable: value})
+
+            with self.subTest(variable=variable, value="0.25"):
+                load_with({variable: "0.25"})
+
+    def test_main_reports_malformed_and_out_of_range_numbers_without_a_traceback(self) -> None:
+        for variable, value in (
+            ("CHUNK_MAX_CHARS", "large"),
+            ("CHUNK_MAX_CHARS", "10"),
+            ("HEALTH_TIMEOUT_SECONDS", "fast"),
+            ("OLLAMA_EMBED_TIMEOUT_SECONDS", "nan"),
+            ("OLLAMA_CHAT_TIMEOUT_SECONDS", "0"),
+        ):
+            stderr = io.StringIO()
+
+            with (
+                self.subTest(variable=variable, value=value),
+                patch.dict(os.environ, {variable: value}, clear=True),
+                patch.object(main, "load_dotenv"),
+                patch.object(local_http.OPENER, "open", side_effect=AssertionError("network call")) as urlopen,
+                patch("sys.stderr", stderr),
+            ):
+                exit_code = main.main(["health"])
+
+                self.assertEqual(exit_code, 2)
+                self.assertIn(f"Invalid settings: {variable}", stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
+                urlopen.assert_not_called()
+
     def test_main_reports_invalid_settings_without_a_traceback(self) -> None:
         stderr = io.StringIO()
 
@@ -401,6 +448,35 @@ class MainTests(unittest.TestCase):
         search.assert_called_once_with(self._settings(), "why sqlite-vec", 3, True)
         evaluate.assert_called_once_with(self._settings(), "questions.txt", 5)
 
+    def test_k_below_one_is_rejected_by_the_parser(self) -> None:
+        for command in (["search", "why"], ["eval", "questions.txt"]):
+            for k in ("0", "-1"):
+                stderr = io.StringIO()
+
+                with (
+                    self.subTest(command=command[0], k=k),
+                    patch.object(main, "load_settings") as load_settings,
+                    patch("sys.stderr", stderr),
+                ):
+                    with self.assertRaises(SystemExit) as caught:
+                        main.main([*command, "-k", k])
+
+                    self.assertEqual(caught.exception.code, 2)
+                    self.assertIn("-k", stderr.getvalue())
+                    load_settings.assert_not_called()
+
+    def test_k_of_one_is_accepted(self) -> None:
+        with (
+            patch.object(main, "load_settings", return_value=self._settings()),
+            patch.object(main, "run_search_command", return_value=0) as search,
+            patch.object(main, "run_eval_command", return_value=0) as evaluate,
+        ):
+            main.main(["search", "why", "-k", "1"])
+            main.main(["eval", "questions.txt", "-k", "1"])
+
+        search.assert_called_once_with(self._settings(), "why", 1, False)
+        evaluate.assert_called_once_with(self._settings(), "questions.txt", 1)
+
     def _settings(self) -> main.Settings:
         return make_settings()
 
@@ -548,7 +624,60 @@ class EvalFileTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 main.parse_eval_file(path)
 
+    def test_parse_eval_file_rejects_an_empty_question_or_expected_file(self) -> None:
+        for line in (" | notes/a.md", "|notes/a.md", "Why A? | ", "Why A? |", "Why A? | ./", "|"):
+            with self.subTest(line=line), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "q.txt"
+                path.write_text(f"# header\n{line}\n", encoding="utf-8")
 
+                with self.assertRaisesRegex(ValueError, r"q\.txt:2: both the question and the expected file"):
+                    main.parse_eval_file(path)
+
+    def test_parse_eval_file_strips_a_leading_dot_slash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "q.txt"
+            path.write_text("Why A? | ./notes/a.md\nWhy B? | notes/./b.md\n", encoding="utf-8")
+            cases = main.parse_eval_file(path)
+
+        self.assertEqual(cases, [("Why A?", "notes/a.md"), ("Why B?", "notes/./b.md")])
+
+    def test_eval_without_questions_fails(self) -> None:
+        for content in ("", "# only a comment\n\n"):
+            stderr = io.StringIO()
+
+            with (
+                self.subTest(content=content),
+                tempfile.TemporaryDirectory() as tmp,
+                patch.object(main, "search_index") as search_index,
+                patch("sys.stderr", stderr),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                path = Path(tmp) / "q.txt"
+                path.write_text(content, encoding="utf-8")
+                exit_code = main.run_eval_command(make_settings(), str(path))
+
+            self.assertEqual(exit_code, 1)
+            self.assertIn("No questions in", stderr.getvalue())
+            search_index.assert_not_called()
+
+    def test_eval_counts_a_dot_slash_expected_path_as_a_hit(self) -> None:
+        from store import SearchHit
+
+        hits = [SearchHit("notes/a.md", "", "text", 0.9)]
+        stdout = io.StringIO()
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(main, "search_index", return_value=(hits, None)),
+            contextlib.redirect_stdout(stdout),
+        ):
+            path = Path(tmp) / "q.txt"
+            path.write_text("Why A? | ./notes/a.md\n", encoding="utf-8")
+            exit_code = main.run_eval_command(make_settings(), str(path))
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("HIT  #1  Why A?", stdout.getvalue())
+        self.assertIn("1/1 questions", stdout.getvalue())
 @contextlib.contextmanager
 def with_hosts_file(content: str):
     with tempfile.TemporaryDirectory() as tmp:
