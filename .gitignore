@@ -222,3 +222,4 @@ data/*
 
 # Agent worktrees
 .worktrees/
+.claude/.cc-writes/
