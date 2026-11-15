@@ -1,11 +1,9 @@
-# TODO
-
 ## Now
-- [ ] Step 3 evaluation set: questions with expected source files, scored with `eval`;
-      planned (not yet implemented): `eval --min-hits N` exits non-zero when fewer than
-      N questions hit, so it can gate CI
+- [ ] Step 5 local answering: `ask` command, source-grounded, per docs/specs/ask.md## Now
 
 ## Done
+- [x] Step 3 evaluation set: 10 questions over 40 real notes (question set kept in
+      the vault, not the repo): 9/10 found their file in the top 5, 8 at rank 1
 - [x] Step 5: `ask "<question>" [-k N]`: top-k chunks as numbered sources to the local
       chat model, answer with `[n]` citations and `Inference:` labels, then the source list.
       No model call without chunks above ASK_MIN_SCORE; NOT_IN_NOTES stops the answer.
