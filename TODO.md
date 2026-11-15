@@ -6,6 +6,10 @@
       N questions hit, so it can gate CI
 
 ## Done
+- [x] Step 5: `ask "<question>" [-k N]`: top-k chunks as numbered sources to the local
+      chat model, answer with `[n]` citations and `Inference:` labels, then the source list.
+      No model call without chunks above ASK_MIN_SCORE; NOT_IN_NOTES stops the answer.
+      Uncited statements and bad citation numbers are flagged on stderr (see docs/decisions.md).
 - [x] Step 2 code review (Claude, agy, Codex) → fixed findings: index safety, local-only
       Ollama without proxies, chunking edge cases (fences, BOM, chunk size)
 - [x] Step 2: ingest one vault folder: chunk markdown, embed, store in sqlite-vec,
@@ -15,7 +19,8 @@
 
 ## Next
 - [ ] Sentry: sensitivity classification at ingest (red/amber/green)
-- [ ] Local answering: source-grounded answers over retrieved chunks, local model only
+- [ ] Local answering follow-ups: tune ASK_MIN_SCORE against the eval set; an `ask` eval
+      that checks every cited source is among the expected files
 - [ ] External gateway: policy-checked, anonymized, logged delegation; off by default
 
 ## Someday

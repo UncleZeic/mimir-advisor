@@ -72,6 +72,7 @@ class Settings:
     health_timeout_seconds: float
     chat_timeout_seconds: float
     embed_timeout_seconds: float
+    ask_min_score: float
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,7 @@ def load_settings() -> Settings:
     embed_timeout_seconds = parse_timeout(
         "OLLAMA_EMBED_TIMEOUT_SECONDS", os.getenv("OLLAMA_EMBED_TIMEOUT_SECONDS", "120")
     )
+    ask_min_score = parse_score("ASK_MIN_SCORE", os.getenv("ASK_MIN_SCORE", "0.35"))
     check_ollama_base_url(ollama_base_url)
 
     for variable, model in (("MODEL_NAME", model_name), ("EMBED_MODEL", embed_model)):
@@ -126,6 +128,7 @@ def load_settings() -> Settings:
         health_timeout_seconds=health_timeout_seconds,
         chat_timeout_seconds=chat_timeout_seconds,
         embed_timeout_seconds=embed_timeout_seconds,
+        ask_min_score=ask_min_score,
     )
 
 
@@ -147,6 +150,16 @@ def parse_timeout(variable: str, raw: str) -> float:
         raise SettingsError(f"{variable} must be a finite number of seconds above 0, got {raw!r}.")
 
     return seconds
+
+
+def parse_score(variable: str, raw: str) -> float:
+    """A cosine similarity threshold: 0 keeps every hit, 1 keeps none."""
+    score = parse_number(variable, raw, float)
+
+    if not math.isfinite(score) or not 0 <= score <= 1:
+        raise SettingsError(f"{variable} must be a number between 0 and 1, got {raw!r}.")
+
+    return score
 
 
 def check_ollama_base_url(url: str) -> None:
@@ -280,24 +293,26 @@ def run_health_command(settings: Settings) -> int:
     return 0
 
 
-def ask_ollama(settings: Settings, prompt: str) -> str:
+CHAT_SYSTEM_PROMPT = (
+    "You are mimir-advisor, a local-first private advisor. "
+    "Answer clearly, avoid pretending to know personal facts that "
+    "were not provided, and mention when no source data is available."
+)
+
+
+def ask_ollama(settings: Settings, prompt: str | None = None, messages: list[dict[str, str]] | None = None) -> str:
+    """One /api/chat round trip. ``prompt`` is wrapped in the plain chat system
+    prompt; ``ask`` passes its own ``messages`` instead. Both go through the
+    same local-model check and the same opener."""
+    if messages is None:
+        if prompt is None:
+            raise ValueError("ask_ollama needs a prompt or messages")
+
+        messages = [{"role": "system", "content": CHAT_SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+
     ensure_local_model(settings.ollama_base_url, settings.model_name, settings.health_timeout_seconds, urlopen)
     url = f"{settings.ollama_base_url.rstrip('/')}/api/chat"
-    payload = {
-        "model": settings.model_name,
-        "stream": False,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are mimir-advisor, a local-first private advisor. "
-                    "Answer clearly, avoid pretending to know personal facts that "
-                    "were not provided, and mention when no source data is available."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-    }
+    payload = {"model": settings.model_name, "stream": False, "messages": messages}
     request = Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
@@ -504,6 +519,69 @@ def run_search_command(settings: Settings, query: str, k: int = 5, full: bool = 
     return 0
 
 
+def run_ask_command(settings: Settings, question: str, k: int = 5) -> int:
+    """Answer ``question`` from the top-k chunks, or say the notes do not hold
+    the answer. Without evidence above ASK_MIN_SCORE the model is never asked."""
+    from answer import build_messages, check_answer, select_sources
+
+    question = question.strip()
+
+    if not question:
+        print("Ask needs a question.", file=sys.stderr)
+        return 1
+
+    root = Path(settings.data_source_dir).expanduser().resolve()
+    print(f"Asking about {root}")
+    hits, error = search_index(settings, question, k)
+
+    if hits is None:
+        if error != "no index":
+            print(f"Ask failed: {error}", file=sys.stderr)
+        return 1
+
+    sources = select_sources(hits, settings.ask_min_score)
+
+    if not sources:
+        where = "No chunks retrieved" if not hits else f"No chunk scored {settings.ask_min_score:.2f} or higher"
+        print(f"{where}; the model was not asked. The notes do not seem to cover this.")
+        return 1
+
+    try:
+        text = ask_ollama(settings, messages=build_messages(question, sources))
+    except (HTTPError, URLError, TimeoutError, ValueError, RemoteModelError) as error:
+        print(f"Ask failed: {error}", file=sys.stderr)
+        return 1
+
+    report = check_answer(text, len(sources))
+
+    if report.not_in_notes:
+        print("The notes do not contain an answer to this question.")
+        return 1
+
+    print(f"\n{text.strip()}\n")
+
+    if report.out_of_range:
+        numbers = ", ".join(f"[{n}]" for n in report.out_of_range)
+        print(f"Warning: the answer cites {numbers}, which do not exist. Treat those claims as unsupported.", file=sys.stderr)
+
+    if report.uncited:
+        print(
+            f"Warning: {len(report.uncited)} statement(s) carry no citation and are not labelled as inference:",
+            file=sys.stderr,
+        )
+
+        for statement in report.uncited:
+            print(f"  - {statement}", file=sys.stderr)
+
+    print("Sources:")
+
+    for source in sources:
+        mark = "cited" if source.number in report.cited else "not cited"
+        print(f"  [{source.number}] {source.location}  ({mark}, score {source.hit.score:.3f})")
+
+    return 0
+
+
 def parse_eval_file(path: Path) -> list[tuple[str, str]]:
     """Lines of `question | expected/file.md`. Blank lines and # comments are ignored."""
     cases = []
@@ -592,6 +670,10 @@ def build_parser() -> ArgumentParser:
     search_parser.add_argument("-k", type=positive_int, default=5, help="number of results (default 5)")
     search_parser.add_argument("--full", action="store_true", help="print whole chunks")
 
+    ask_parser = subparsers.add_parser("ask", help="answer a question from retrieved notes, with sources")
+    ask_parser.add_argument("question", nargs="+", help="what to ask")
+    ask_parser.add_argument("-k", type=positive_int, default=5, help="chunks to retrieve (default 5)")
+
     eval_parser = subparsers.add_parser("eval", help="score retrieval against a question file")
     eval_parser.add_argument("eval_file", help="lines of: question | expected/file.md")
     eval_parser.add_argument("-k", type=positive_int, default=5, help="top-k to count as a hit (default 5)")
@@ -618,6 +700,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "search":
         return run_search_command(settings, " ".join(args.query), args.k, args.full)
+
+    if args.command == "ask":
+        return run_ask_command(settings, " ".join(args.question), args.k)
 
     if args.command == "eval":
         return run_eval_command(settings, args.eval_file, args.k)

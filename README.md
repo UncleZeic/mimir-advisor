@@ -127,7 +127,21 @@ An eval file has one `question | expected/file.md` per line, paths relative to t
 Changing `EMBED_MODEL` or `CHUNK_MAX_CHARS` needs `ingest --rebuild`, which builds a
 new index next to the old one and swaps it in only when it completes.
 
-Chat with the local model (no retrieval yet):
+Ask a question and get an answer grounded in your notes. The top-k chunks (default 5)
+go to the local chat model as numbered sources; the answer cites them as `[n]`, labels
+anything beyond the sources as `Inference:`, and the source list follows:
+
+```bash
+python3 src/main.py ask "why did I pick sqlite-vec"
+DATA_SOURCE_DIR=/tank/vault/tech python3 src/main.py ask "what did I decide about backups" -k 8
+```
+
+Chunks scoring below `ASK_MIN_SCORE` (cosine similarity, default 0.35) are dropped. When
+nothing is left the model is not called at all; when the sources do not contain the answer
+the model says so and `ask` stops instead of answering from general knowledge. Statements
+without a citation, or citing a source that was not provided, are flagged on stderr.
+
+Chat with the local model (no retrieval):
 
 ```bash
 python3 src/main.py chat "What can you help me understand?"

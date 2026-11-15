@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import io
 import os
 import re
@@ -17,6 +18,7 @@ import embeddings
 import local_http
 import main
 from helpers import with_proxy_environment
+from store import SearchHit
 
 ROOT = Path(__file__).resolve().parents[1]
 TAGS_URL = "http://localhost:11434/api/tags"
@@ -51,6 +53,16 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.index_dir, "~/.local/share/mimir-advisor/index")
         self.assertEqual(settings.chunk_max_chars, 1200)
         self.assertEqual(settings.health_timeout_seconds, 2)
+        self.assertEqual(settings.ask_min_score, 0.35)
+
+    def test_ask_min_score_is_read_and_validated(self) -> None:
+        with patch.dict(os.environ, {"ASK_MIN_SCORE": "0.5"}, clear=True), patch.object(main, "load_dotenv"):
+            self.assertEqual(main.load_settings().ask_min_score, 0.5)
+
+        for raw in ("-0.1", "1.5", "nan", "inf", "high"):
+            with self.subTest(raw=raw), patch.dict(os.environ, {"ASK_MIN_SCORE": raw}, clear=True):
+                with patch.object(main, "load_dotenv"), self.assertRaisesRegex(main.SettingsError, "ASK_MIN_SCORE"):
+                    main.load_settings()
 
     def test_load_settings_uses_environment_values(self) -> None:
         env = {
@@ -439,14 +451,17 @@ class MainTests(unittest.TestCase):
             patch.object(main, "run_ingest_command", return_value=0) as ingest,
             patch.object(main, "run_search_command", return_value=0) as search,
             patch.object(main, "run_eval_command", return_value=0) as evaluate,
+            patch.object(main, "run_ask_command", return_value=0) as ask,
         ):
             main.main(["ingest", "--rebuild"])
             main.main(["search", "why", "sqlite-vec", "-k", "3", "--full"])
             main.main(["eval", "questions.txt"])
+            main.main(["ask", "why", "sqlite-vec", "-k", "2"])
 
         ingest.assert_called_once_with(self._settings(), True)
         search.assert_called_once_with(self._settings(), "why sqlite-vec", 3, True)
         evaluate.assert_called_once_with(self._settings(), "questions.txt", 5)
+        ask.assert_called_once_with(self._settings(), "why sqlite-vec", 2)
 
     def test_k_below_one_is_rejected_by_the_parser(self) -> None:
         for command in (["search", "why"], ["eval", "questions.txt"]):
@@ -607,6 +622,145 @@ class ChatTests(unittest.TestCase):
         return make_settings()
 
 
+class AskTests(unittest.TestCase):
+    """`ask` with retrieval and Ollama mocked. Every path that must not call
+    the model asserts that urlopen was never used."""
+
+    HITS = [
+        SearchHit("projects/metis.md", "Storage", "We chose sqlite-vec because it needs no server.", 0.81),
+        SearchHit("jurnal/2026-01.md", "Notes", "Tried Chroma, it wanted a daemon.", 0.62),
+        SearchHit("reading/list.md", "", "Unrelated book notes.", 0.12),
+    ]
+
+    def run_ask(self, hits, reply: bytes | None, question: str = "why sqlite-vec?", k: int = 5, **overrides):
+        settings = dataclasses.replace(make_settings(), **overrides)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        responses = [UrlopenResponse(200, b'{"models": [{"name": "gemma4:12b"}]}')]
+
+        if reply is not None:
+            responses.append(UrlopenResponse(200, reply))
+
+        with (
+            patch.object(main, "search_index", return_value=(hits, None)),
+            patch.object(main, "urlopen", side_effect=responses) as urlopen,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = main.run_ask_command(settings, question, k)
+
+        return code, stdout.getvalue(), stderr.getvalue(), urlopen
+
+    def test_prompt_carries_numbered_sources_above_the_threshold_only(self) -> None:
+        reply = b'{"message": {"content": "sqlite-vec needs no server [1]."}}'
+        code, out, err, urlopen = self.run_ask(self.HITS, reply)
+
+        self.assertEqual(code, 0, err)
+        chat = next(call.args[0] for call in urlopen.call_args_list if call.args[0].full_url.endswith("/api/chat"))
+        payload = json_from_request(chat)
+        system, user = payload["messages"]
+
+        self.assertEqual(payload["model"], "gemma4:12b")
+        self.assertFalse(payload["stream"])
+        self.assertEqual(system["role"], "system")
+        self.assertIn("NOT_IN_NOTES", system["content"])
+        self.assertIn("[1] projects/metis.md › Storage\nWe chose sqlite-vec because it needs no server.", user["content"])
+        self.assertIn("[2] jurnal/2026-01.md › Notes\nTried Chroma", user["content"])
+        self.assertNotIn("Unrelated book notes", user["content"])
+        self.assertNotIn("[3]", user["content"])
+        self.assertIn("Question: why sqlite-vec?", user["content"])
+
+    def test_answer_is_printed_with_cited_and_uncited_sources(self) -> None:
+        reply = b'{"message": {"content": "sqlite-vec needs no server [1].\\nInference: that kept the setup small."}}'
+        code, out, err, _ = self.run_ask(self.HITS, reply)
+
+        self.assertEqual(code, 0)
+        self.assertIn("sqlite-vec needs no server [1].", out)
+        self.assertIn("Inference: that kept the setup small.", out)
+        self.assertIn("Sources:\n  [1] projects/metis.md › Storage  (cited, score 0.810)", out)
+        self.assertIn("[2] jurnal/2026-01.md › Notes  (not cited, score 0.620)", out)
+        self.assertNotIn("reading/list.md", out)
+        self.assertEqual(err, "")
+
+    def test_uncited_statements_and_bad_numbers_are_flagged(self) -> None:
+        reply = b'{"message": {"content": "sqlite-vec needs no server [1]. Chroma was slow. See also [7]."}}'
+        code, out, err, _ = self.run_ask(self.HITS, reply)
+
+        self.assertEqual(code, 0)
+        self.assertIn("cites [7], which do not exist", err)
+        self.assertIn("1 statement(s) carry no citation", err)
+        self.assertIn("  - Chroma was slow.", err)
+
+    def test_no_chunks_means_the_model_is_not_called(self) -> None:
+        code, out, err, urlopen = self.run_ask([], None)
+
+        self.assertEqual(code, 1)
+        self.assertIn("No chunks retrieved; the model was not asked.", out)
+        self.assertEqual(urlopen.call_count, 0)
+
+    def test_all_chunks_below_threshold_means_the_model_is_not_called(self) -> None:
+        code, out, err, urlopen = self.run_ask(self.HITS, None, ask_min_score=0.9)
+
+        self.assertEqual(code, 1)
+        self.assertIn("No chunk scored 0.90 or higher; the model was not asked.", out)
+        self.assertEqual(urlopen.call_count, 0)
+
+    def test_not_in_notes_reply_stops_without_an_answer(self) -> None:
+        code, out, err, _ = self.run_ask(self.HITS, b'{"message": {"content": "NOT_IN_NOTES"}}')
+
+        self.assertEqual(code, 1)
+        self.assertIn("The notes do not contain an answer to this question.", out)
+        self.assertNotIn("Sources:", out)
+        self.assertNotIn("NOT_IN_NOTES", out)
+
+    def test_remote_chat_model_is_refused_before_the_prompt_is_sent(self) -> None:
+        tags = UrlopenResponse(200, b'{"models": [{"name": "gemma4:12b", "remote_host": "https://ollama.com:443"}]}')
+        stdout, stderr = io.StringIO(), io.StringIO()
+
+        with (
+            patch.object(main, "search_index", return_value=(self.HITS, None)),
+            patch.object(main, "urlopen", side_effect=[tags]) as urlopen,
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = main.run_ask_command(make_settings(), "why sqlite-vec?", 5)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Ask failed: 'gemma4:12b' is served from https://ollama.com:443", stderr.getvalue())
+        self.assertEqual([call.args[0].full_url for call in urlopen.call_args_list], ["http://ollama:11434/api/tags"])
+
+    def test_cloud_model_name_is_refused_by_settings(self) -> None:
+        with patch.dict(os.environ, {"MODEL_NAME": "gemma4:12b-cloud"}, clear=True), patch.object(main, "load_dotenv"):
+            with self.assertRaisesRegex(main.SettingsError, "MODEL_NAME=gemma4:12b-cloud is an Ollama cloud model"):
+                main.load_settings()
+
+    def test_search_failure_is_reported(self) -> None:
+        stderr = io.StringIO()
+
+        with (
+            patch.object(main, "search_index", return_value=(None, "index is corrupt")),
+            patch.object(main, "urlopen") as urlopen,
+            patch("builtins.print"),
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = main.run_ask_command(make_settings(), "anything", 5)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(urlopen.call_count, 0)
+
+    def test_blank_question_is_rejected_without_retrieval(self) -> None:
+        stderr = io.StringIO()
+
+        with (
+            patch.object(main, "search_index") as search,
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = main.run_ask_command(make_settings(), "   ", 5)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Ask needs a question.", stderr.getvalue())
+        search.assert_not_called()
+
+
 class EvalFileTests(unittest.TestCase):
     def test_parse_eval_file_skips_comments_and_blanks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -706,6 +860,7 @@ def make_settings() -> main.Settings:
         health_timeout_seconds=2,
         chat_timeout_seconds=60,
         embed_timeout_seconds=120,
+        ask_min_score=0.35,
     )
 
 

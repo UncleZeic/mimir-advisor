@@ -40,6 +40,7 @@ class FakeOllama(BaseHTTPRequestHandler):
     posts: list[str] = []
     embed_raw: bytes | None = None
     chat_bodies: list[dict] = []
+    chat_reply: str = "Local answer.\n"
 
     def do_GET(self) -> None:
         self._send({"models": FakeOllama.tags})
@@ -52,7 +53,7 @@ class FakeOllama(BaseHTTPRequestHandler):
             self._send_raw(FakeOllama.embed_raw)
         elif self.path == "/api/chat":
             FakeOllama.chat_bodies.append(body)
-            self._send({"message": {"content": "Local answer.\n"}})
+            self._send({"message": {"content": FakeOllama.chat_reply}})
         else:
             self._send({"embeddings": [EMBEDDER.vector(text) for text in body["input"]]})
 
@@ -142,6 +143,7 @@ class CliEndToEndTests(unittest.TestCase):
         FakeOllama.posts = []
         FakeOllama.embed_raw = None
         FakeOllama.chat_bodies = []
+        FakeOllama.chat_reply = "Local answer.\n"
         self.tmp = tempfile.mkdtemp()
         self.env = {
             "OLLAMA_BASE_URL": f"http://127.0.0.1:{self.server.server_address[1]}",
@@ -397,6 +399,59 @@ class CliEndToEndTests(unittest.TestCase):
 
         code, out = self.run_cli("ingest")
         self.assertIn("6 unchanged", out)
+
+    def test_ask_answers_from_retrieved_chunks_and_lists_sources(self) -> None:
+        code, out = self.run_cli("ingest")
+        self.assertEqual(code, 0, out)
+        FakeOllama.posts.clear()
+        FakeOllama.chat_reply = "sqlite-vec needs no server [1]."
+        # The hashing embedder's scores are not calibrated like a real model's.
+        self.env["ASK_MIN_SCORE"] = "0"
+
+        code, out = self.run_cli("ask", "why", "sqlite-vec", "instead", "of", "Chroma", "-k", "3")
+
+        self.assertEqual(code, 0, out)
+        self.assertIn("sqlite-vec needs no server [1].", out)
+        self.assertIn("Sources:\n  [1] projects/metis-decisions.md › Metis architecture decisions › Storage  (cited", out)
+        self.assertEqual(FakeOllama.posts, ["/api/embed", "/api/chat"])
+        [body] = FakeOllama.chat_bodies
+        self.assertEqual(body["model"], "gemma4:12b")
+        self.assertNotIn("think", body)
+        self.assertIn("[1] projects/metis-decisions.md › Metis architecture decisions › Storage", body["messages"][1]["content"])
+        self.assertLessEqual(body["messages"][1]["content"].count("\n["), 3)
+
+    def test_ask_with_a_remote_chat_model_sends_no_chunks(self) -> None:
+        code, out = self.run_cli("ingest")
+        self.assertEqual(code, 0, out)
+        FakeOllama.posts.clear()
+        FakeOllama.tags = [{"name": "gemma4:12b", **REMOTE}, {"name": "bge-m3:latest"}]
+        self.env["ASK_MIN_SCORE"] = "0"
+
+        code, out = self.run_cli("ask", "why sqlite-vec")
+
+        self.assertEqual(code, 1)
+        self.assertIn("Ask failed: 'gemma4:12b' is served from https://ollama.com:443", out)
+        self.assertEqual(FakeOllama.posts, ["/api/embed"])
+        self.assertEqual(FakeOllama.chat_bodies, [])
+
+    def test_ask_below_threshold_never_reaches_the_chat_model(self) -> None:
+        code, out = self.run_cli("ingest")
+        self.assertEqual(code, 0, out)
+        FakeOllama.posts.clear()
+        self.env["ASK_MIN_SCORE"] = "0.99"
+
+        code, out = self.run_cli("ask", "why sqlite-vec")
+
+        self.assertEqual(code, 1)
+        self.assertIn("No chunk scored 0.99 or higher; the model was not asked.", out)
+        self.assertEqual(FakeOllama.posts, ["/api/embed"])
+
+    def test_ask_before_ingest_says_what_to_do(self) -> None:
+        code, out = self.run_cli("ask", "anything")
+
+        self.assertEqual(code, 1)
+        self.assertIn("Run ingest first", out)
+        self.assertEqual(FakeOllama.posts, [])
 
     def test_chat_sends_the_default_model_without_think(self) -> None:
         code, out = self.run_cli("chat", "hello")
