@@ -6,6 +6,7 @@ Local-first private advisor. See README.md for principles.
 - No network calls except the configured OLLAMA_BASE_URL.
 - Indexes never live inside the repo, also under Docker (host ~/.local/share/mimir-advisor/index mounted at /index).
 - Never commit or push. Show the diff and stop; the human commits.
+- State lives in TODO.md and docs/decisions.md; update both in the same change as the code.
 
 ## Roles
 - Writer (Claude Code): edits code in the main checkout. Every change ships with unittest tests.

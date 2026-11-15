@@ -90,7 +90,7 @@ One-time setup, from the repo root:
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 cp .env.template .env
-ollama pull qwen3:8b && ollama pull bge-m3
+ollama pull gemma4:12b && ollama pull bge-m3
 ```
 
 Only local models are accepted. Ollama cloud models (tags ending in `-cloud`, or any model

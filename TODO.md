@@ -2,7 +2,8 @@
 
 ## Now
 - [ ] Step 3 evaluation set: questions with expected source files, scored with `eval`;
-      `eval --min-hits N` exits non-zero when fewer than N questions hit, so it can gate CI
+      planned (not yet implemented): `eval --min-hits N` exits non-zero when fewer than
+      N questions hit, so it can gate CI
 
 ## Done
 - [x] Step 2 code review (Claude, agy, Codex) → fixed findings: index safety, local-only
@@ -10,6 +11,7 @@
 - [x] Step 2: ingest one vault folder: chunk markdown, embed, store in sqlite-vec,
       `search` command prints top-5 chunks with source filenames. No model call.
 - [x] Step 1: qwen3 thinking-output fix: `think: false` on /api/chat, `strip_think` fallback, default qwen3:8b
+      (qwen3 workaround removed on 2026-10-28; default is now gemma4:12b)
 
 ## Next
 - [ ] Sentry: sensitivity classification at ingest (red/amber/green)
